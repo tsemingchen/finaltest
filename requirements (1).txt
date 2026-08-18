@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+plotly
+fpdf2
+openpyxl
+requests
+statsmodels
+psycopg2-binary
+pmdarima

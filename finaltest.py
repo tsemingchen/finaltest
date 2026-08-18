@@ -1007,6 +1007,43 @@ def compute_shares(sales_df, group_cols, recent_days=120):
 
 
 @st.cache_data(hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def walk_forward_topdown(sales_df, n_periods=12, freq="W", product_type=None):
+    """The ONE walk-forward historical-forecast calculation, shared by both the Overview
+    chart and the Staple/Single table -- fixes a real inconsistency: the Overview chart used
+    to sum many small per-item walk-forward forecasts (bottom-up), while the Staple/Single
+    table used a direct aggregate walk-forward fit per type (top-down). Same class of bug
+    found and fixed before with stale frozen forecasts, just resurfacing here as two
+    independently-written methods that could show different numbers for the same week.
+    Having every caller use this same function, rather than each writing its own version,
+    is what actually guarantees they can't drift apart again.
+
+    product_type=None (default): sums across every type -- for the whole-company Overview.
+    product_type="Staple" (or "Single"): that type alone -- for the Staple/Single table.
+
+    Returns a DataFrame with columns: period, forecast_kg."""
+    if "product_type" not in sales_df.columns:
+        return pd.DataFrame(columns=["period", "forecast_kg"])
+    types_to_run = [product_type] if product_type else \
+        [pt for pt in sales_df["product_type"].dropna().unique() if pt != "(not tracked)"]
+    per_type_frames = []
+    for pt in types_to_run:
+        pt_df = sales_df[sales_df["product_type"] == pt]
+        agg = aggregate_periods(pt_df, ["product_type"], freq).sort_values("period").reset_index(drop=True)
+        rows = []
+        for i in range(max(len(agg) - n_periods, 2), len(agg)):
+            history_before = agg["actual_kg"].iloc[:i].tolist()
+            f = trend_forecast(history_before)
+            if f is not None:
+                rows.append({"period": agg["period"].iloc[i], "forecast_kg": f})
+        if rows:
+            per_type_frames.append(pd.DataFrame(rows))
+    if not per_type_frames:
+        return pd.DataFrame(columns=["period", "forecast_kg"])
+    combined = pd.concat(per_type_frames, ignore_index=True)
+    return combined.groupby("period", as_index=False)["forecast_kg"].sum()
+
+
+@st.cache_data(hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
     """Like compute_shares, but projects each segment's share FORWARD based on its own
     recent trend, instead of just averaging history. Real problem this solves: a flat
@@ -1377,8 +1414,15 @@ with tab_dash:
             d_trend["period"] = d_trend["record_date"].dt.to_period("M").astype(str)
         trend_agg = d_trend.groupby("period", as_index=False)["kg"].sum().sort_values("period")
 
-        total_bt = backtest_df.groupby("week_start", as_index=False).agg(
-            forecast_kg=("forecast_kg", "sum"), actual_kg=("actual_kg", "sum"))
+        # same shared top-down calculation the Staple/Single table uses -- this is the actual
+        # fix for the inconsistency: previously this summed many small per-item backtests
+        # (bottom-up), while the Staple/Single table used one aggregate fit per type
+        # (top-down). Different methods, no reason to agree. Now both call the exact same
+        # function, so they can't drift apart again.
+        wf_freq = "W" if trend_freq == "Week" else "M"
+        topdown_bt = walk_forward_topdown(sales_df, n_periods=26, freq=wf_freq)
+        total_bt = trend_agg.rename(columns={"period": "week_start", "kg": "actual_kg"}).merge(
+            topdown_bt.rename(columns={"period": "week_start"}), on="week_start", how="inner")
         total_bt["variance_pct"] = (total_bt["actual_kg"] - total_bt["forecast_kg"]) / total_bt["forecast_kg"].replace(0, np.nan)
         error_sigma = total_bt["variance_pct"].std()
 
@@ -1494,26 +1538,12 @@ with tab_dash:
                         columns={"period": "Period", "actual_kg": "Actual (kg)"})
 
                     if pt_horizon == "Week":
-                        # walk-forward recompute using the CURRENT top-down method (same one
-                        # used for the forward projection above), rather than looking up old
-                        # frozen auto_forecasts rows. Real issue found: those rows were frozen
-                        # by the OLD per-item bottom-up method, before this app was rebuilt to
-                        # forecast Staple/Single directly -- so a week could show a stored value
-                        # from a since-replaced method once it became historical, inconsistent
-                        # with the live projection shown for it a moment earlier as a future
-                        # week. Recomputing fresh with today's method for each week (using only
-                        # data that existed before that week -- no peeking) keeps this genuinely
-                        # consistent and honest, matching the walk-forward validation approach.
-                        agg_pt_sorted = agg_pt.sort_values("period").reset_index(drop=True)
-                        walk_forward_rows = []
-                        for i in range(len(agg_pt_sorted) - n_history_shown, len(agg_pt_sorted)):
-                            if i < 2:
-                                continue
-                            history_before = agg_pt_sorted["actual_kg"].iloc[:i].tolist()
-                            f = trend_forecast(history_before)  # fast method -- several of these run per render
-                            walk_forward_rows.append({"Period": agg_pt_sorted["period"].iloc[i], "Forecast (kg)": f})
-                        stored_by_week = pd.DataFrame(walk_forward_rows) if walk_forward_rows \
-                            else pd.DataFrame(columns=["Period", "Forecast (kg)"])
+                        # same shared function the Overview chart now uses -- previously this
+                        # was its own separate inline implementation, which is exactly how the
+                        # two views could drift apart again even after being fixed once. One
+                        # function, called from both places, is what actually prevents that.
+                        wf = walk_forward_topdown(sales_df, n_periods=n_history_shown, freq="W", product_type=pt)
+                        stored_by_week = wf.rename(columns={"period": "Period", "forecast_kg": "Forecast (kg)"})
                         recent_actual = recent_actual.merge(stored_by_week, on="Period", how="left")
                     else:
                         recent_actual["Forecast (kg)"] = None

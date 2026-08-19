@@ -1524,6 +1524,13 @@ with tab_dash:
                     # periods untouched.
                     direct_forecast = type_level_forecasts_h.get(pt)
                     if not projection_pt.empty and direct_forecast is not None:
+                        # explicit float cast before assigning -- real bug found: pandas 3.0
+                        # raises a TypeError instead of silently upcasting a whole-number
+                        # (int64) column to decimals, which older pandas did automatically.
+                        # These columns can end up all-integer (e.g. all zeros) via the
+                        # fallback projection path, especially early on with little history.
+                        for col in ["forecast_kg", "low", "high"]:
+                            projection_pt[col] = projection_pt[col].astype(float)
                         offset = direct_forecast - projection_pt["forecast_kg"].iloc[0]
                         projection_pt.loc[projection_pt.index[0], "forecast_kg"] = max(direct_forecast, 0)
                         projection_pt.loc[projection_pt.index[0], "low"] = max(projection_pt["low"].iloc[0] + offset, 0)

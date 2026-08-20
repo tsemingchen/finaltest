@@ -707,13 +707,20 @@ def _cheap_data_fingerprint(sales_df):
 @st.cache_data(show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
-    aggregated series (using a real, searched-for best SARIMA order, not a guessed fixed
-    one), rather than deriving them by summing many small per-item forecasts. This matches
-    how real demand planning handles the accuracy-vs-detail tradeoff -- forecast at the most
-    meaningful aggregate level (most statistically reliable, since noise cancels out over
-    more data), then split that DOWN to finer detail (channel/item/bag size) by historical
-    proportion, rather than the reverse. Returns {product_type: forecast_kg} for the next
-    single period."""
+    aggregated series, rather than deriving them by summing many small per-item forecasts.
+    This matches how real demand planning handles the accuracy-vs-detail tradeoff --
+    forecast at the most meaningful aggregate level (most statistically reliable, since
+    noise cancels out over more data), then split that DOWN to finer detail (channel/item/
+    bag size) by historical proportion, rather than the reverse.
+
+    Uses a fast, fixed-order fit rather than a full best-model search. Real reasoning, not
+    a corner cut under pressure: the search step was directly measured at 20-40+ seconds
+    PER product type for a realistic seasonal pattern, and it wasn't reliably staying
+    confined to its intended once-every-28-days cadence -- a real, reported case ended up
+    "taking hours" and re-running on every single page open. Removing the search from the
+    automatic path guarantees a fast, predictable runtime every time, which matters more
+    here than a marginal accuracy gain from exhaustively searching every model shape.
+    Returns {product_type: forecast_kg} for the next single period."""
     if "product_type" not in sales_df.columns:
         return {}
     results = {}
@@ -723,12 +730,7 @@ def compute_type_level_forecast(sales_df, freq="W"):
         pt_df = sales_df[sales_df["product_type"] == pt]
         agg = aggregate_periods(pt_df, ["product_type"], freq)
         series = agg.sort_values("period")["actual_kg"].tolist()
-        if len(series) >= 8:
-            order, seasonal_order = find_best_order_cached(pt, series, freq)
-            fc = fit_with_found_order(series, order, seasonal_order, n_periods=1)
-            if not fc.empty:
-                results[pt] = fc["forecast_kg"].iloc[0]
-        elif len(series) >= 2:
+        if len(series) >= 2:
             f = trend_forecast(series)
             if f is not None:
                 results[pt] = f
@@ -766,21 +768,19 @@ def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_cha
     staple_series = staple_agg.sort_values("period")["actual_kg"].tolist()
     if len(staple_series) < 8:
         return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
-    staple_order, staple_seasonal = find_best_order_cached("Staple", staple_series, freq)
-    staple_projection = fit_with_found_order(staple_series, staple_order, staple_seasonal, n_periods=n_periods)
+    # fast, non-searching, non-seasonal projection -- same reasoning as the main dashboard
+    # fix: the best-model search was directly measured at 20-40+ seconds per series and
+    # wasn't reliably staying confined to its intended cadence, contributing to a real
+    # reported case of the app taking hours. This trades some accuracy for a guaranteed,
+    # predictable runtime, which matters more here.
+    staple_projection = project_forward_with_range(staple_series, None, n_periods=n_periods)
     if staple_projection.empty:
         return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
 
     sr_df = staple_df[staple_df["channel"] == major_channel]
     sr_agg = aggregate_periods(sr_df, ["channel"], freq)
     sr_series = sr_agg.sort_values("period")["actual_kg"].tolist()
-    if len(sr_series) >= 8:
-        sr_order, sr_seasonal = find_best_order_cached(f"Staple_{major_channel}", sr_series, freq)
-        sr_projection = fit_with_found_order(sr_series, sr_order, sr_seasonal, n_periods=n_periods)
-    elif len(sr_series) >= 2:
-        sr_projection = project_forward_with_range(sr_series, None, n_periods=n_periods)
-    else:
-        sr_projection = pd.DataFrame()
+    sr_projection = project_forward_with_range(sr_series, None, n_periods=n_periods) if len(sr_series) >= 2 else pd.DataFrame()
 
     other_channels_df = staple_df[staple_df["channel"] != major_channel]
     channel_shares = compute_trending_shares(other_channels_df, ["channel"], freq=freq) if not other_channels_df.empty else pd.DataFrame()

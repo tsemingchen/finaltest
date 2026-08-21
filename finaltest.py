@@ -242,6 +242,20 @@ def load_sales_records():
     return df
 
 
+def reset_all_derived_state():
+    """Clears EVERY cached computation and stored result after the underlying sales data
+    changes. Real bug this fixes: deleting a batch only cleared the sales-data cache, so
+    every downstream cached value (segment forecasts, walk-forward history, trending shares,
+    projections) and the stored accuracy results in session_state stayed behind. The
+    dashboard would keep showing numbers derived from data that no longer existed, and
+    deleting a batch appeared to do nothing. Clearing everything is slightly heavier than
+    clearing selectively, but data changes are rare and being wrong here is much worse than
+    being a few seconds slower."""
+    st.cache_data.clear()
+    for key in ["backtest_df", "show_staple_breakdown"]:
+        st.session_state.pop(key, None)
+
+
 def insert_dataframe(table_name, df, batch_size=300, show_progress=False):
     """Replaces pandas' df.to_sql() -- that function has special-cased internals that only
     work with a real SQLAlchemy connection or an actual sqlite3.Connection object, so it
@@ -2574,7 +2588,7 @@ with tab_data:
                 mapping_to_remember.update({"units_col": units_col, "weight_col": weight_col})
             save_upload_column_defaults(mapping_to_remember)
 
-            load_sales_records.clear()  # force fresh data immediately, not a stale cache for up to 60s
+            reset_all_derived_state()
             st.success(f"Saved {len(std)} records from batch '{batch_name}'. Forecast will update below.")
             st.rerun()
 
@@ -2591,7 +2605,7 @@ with tab_data:
             if st.button("Delete this batch"):
                 conn.execute("DELETE FROM sales_records WHERE upload_batch = ?", (batch_to_delete,))
                 conn.commit()
-                load_sales_records.clear()  # same reason as the upload path -- avoid a stale cache after deletion
+                reset_all_derived_state()
 
                 # real cleanup, not just a disclosed limitation -- figure out what the latest
                 # actual week is NOW that this batch is gone, and remove any frozen forecasts

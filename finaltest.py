@@ -1222,19 +1222,24 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 def project_forward_with_range(actual_series, error_sigma, n_periods=8):
-    """Projects multiple periods ahead. With 2+ years of history (104+ points), tries a real
-    seasonal SARIMA(1,1,1)x(1,1,1,52) so the projected range can reflect a genuine yearly
-    cycle, not just recent trend. With 8-104 points, non-seasonal ARIMA. Either way, this is
-    a single fit producing the whole path at once with real statistical confidence intervals,
-    not recursive re-feeding (verified: recursive re-feeding through ARIMA produced a forecast
-    that more than doubled over 8 weeks with no plateau; the native multi-step call plateaus
-    correctly). Falls back to the damped recursive median method, with an empirical-error-based
-    range, when there's too little data for ARIMA. Cached -- ARIMA fits are slow, especially
-    the seasonal tier (~12s measured), so this should only run once per actual data change."""
+    """Projects multiple periods ahead using a single non-seasonal ARIMA(1,1,1) fit, which
+    produces the whole path at once with real statistical confidence intervals (verified:
+    recursive re-feeding through ARIMA produced a forecast that more than doubled over 8
+    weeks with no plateau; the native multi-step call plateaus correctly). Falls back to the
+    damped recursive median method when there's too little data.
+
+    The seasonal tier was REMOVED. Real reason, from a reported production failure: with 2+
+    years of history this ran a seasonal SARIMA(1,1,1)x(1,1,1,52) fit, measured at ~16s each
+    on a fast machine and considerably slower on Streamlit Cloud's shared CPU. The
+    Staple/Single panel calls this once per product type automatically on page load, and one
+    long blocking fit prevents Streamlit from answering the browser's heartbeat -- producing
+    a "Connection timed out" error mid-render, which then forces a refresh and starts the
+    whole thing over. Same tradeoff already accepted elsewhere in this app: explicit yearly
+    seasonality is given up in exchange for the app actually staying connected."""
     vals = np.asarray(actual_series, dtype=float)
     n = len(vals)
     if n >= 8:
-        seasonal = (1, 1, 1, 52) if n >= 104 else (0, 0, 0, 0)
+        seasonal = (0, 0, 0, 0)
         try:
             import warnings
             with warnings.catch_warnings():
@@ -1553,8 +1558,7 @@ with tab_dash:
         error_sigma = total_bt["variance_pct"].std()
 
         n_periods_fwd = 8 if trend_freq == "Week" else 6
-        show_projection = st.checkbox("Also show the forecast projection (runs a real seasonal fit, "
-                                       "~15-20s first time, cached after)", key="show_trend_projection")
+        show_projection = st.checkbox("Also show the forecast projection", key="show_trend_projection")
         if show_projection:
             with st.spinner("Projecting the trend forward..."):
                 projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma, n_periods=n_periods_fwd)

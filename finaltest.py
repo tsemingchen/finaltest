@@ -211,7 +211,15 @@ def get_conn():
 conn = get_conn()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_sales_records():
+    """Cached with a 60-second TTL -- real issue found: this was re-downloading the ENTIRE
+    sales history over the network on every single interaction (Streamlit reruns the whole
+    script on every click, not just new uploads), since it wasn't cached at all. That's both
+    a real time cost on every click AND likely a real contributor to hitting Supabase's
+    bandwidth quota. A short TTL keeps this fast for a whole working session while still
+    picking up new uploads within a minute -- not stale for hours, just not re-fetched on
+    every single click within the same minute."""
     return pd.read_sql("SELECT * FROM sales_records", conn)
 
 
@@ -381,6 +389,45 @@ def default_index(options, saved_value, fallback=0):
     if saved_value in options:
         return options.index(saved_value)
     return fallback
+
+
+def check_stale_ongoing_overrides(weekly_actual, active_overrides, n_weeks=4, tolerance=0.30):
+    """Flags ONGOING overrides that real actuals have consistently contradicted.
+
+    Real gap this closes: a one-time override auto-expires once the forecast week moves on,
+    but an ongoing override applies forever with no reality check -- so one set months ago
+    could quietly still be distorting today's numbers with nobody noticing. Deliberately
+    does NOT auto-remove them, because the legitimate use case (e.g. "this account
+    permanently switched to biweekly ordering") genuinely should persist. Instead it
+    surfaces them for a human to confirm or clear.
+
+    Flags an override if, over the last n_weeks of real actuals for that channel/product,
+    the average actual differs from the override by more than `tolerance` (default 30%).
+    Returns a list of dicts describing what looks stale and by how much."""
+    if active_overrides is None or active_overrides.empty or weekly_actual.empty:
+        return []
+    flagged = []
+    for _, row in active_overrides.iterrows():
+        if row.get("period_type") != "Ongoing":
+            continue
+        hist = weekly_actual[(weekly_actual["channel"] == row["channel"]) &
+                             (weekly_actual["product"] == row["product"])].sort_values("week_start")
+        recent = hist.tail(n_weeks)
+        if len(recent) < n_weeks:
+            continue  # not enough real weeks yet to judge it fairly
+        avg_actual = recent["actual_kg"].mean()
+        override_val = row["override_kg"]
+        if override_val and override_val > 0:
+            drift = abs(avg_actual - override_val) / override_val
+            if drift > tolerance:
+                flagged.append({
+                    "channel": row["channel"], "product": row["product"],
+                    "override_kg": round(float(override_val), 1),
+                    "recent_avg_actual_kg": round(float(avg_actual), 1),
+                    "off_by_pct": round(float(drift * 100), 0),
+                    "weeks_checked": n_weeks,
+                })
+    return flagged
 
 
 def load_known_classifications():
@@ -777,12 +824,30 @@ def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_cha
     if staple_projection.empty:
         return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
 
+    # THREE independent forecasts, not two-plus-a-subtraction:
+    #   1. Specialty Retail (its own model)
+    #   2. The rest of Staple (its own model)
+    #   3. Staple overall (its own model -- used only as a reconciliation anchor)
+    # Rationale for the change: SR and the rest of Staple can behave genuinely differently
+    # (different trend, different seasonality), so giving the remainder its own model rather
+    # than deriving it by subtraction lets it follow its own real shape.
+    #
+    # Honest tradeoff, worth understanding: independent forecasts have no mathematical reason
+    # to sum to the Staple total. Aggregate forecasts are usually MORE accurate than the sum
+    # of their parts (noise cancels out over more data), so we still forecast Staple overall
+    # and scale the two parts proportionally to match it. That keeps the parts following
+    # their own real trajectories while preserving the reconciliation guarantee the rest of
+    # the app depends on.
     sr_df = staple_df[staple_df["channel"] == major_channel]
     sr_agg = aggregate_periods(sr_df, ["channel"], freq)
     sr_series = sr_agg.sort_values("period")["actual_kg"].tolist()
     sr_projection = project_forward_with_range(sr_series, None, n_periods=n_periods) if len(sr_series) >= 2 else pd.DataFrame()
 
     other_channels_df = staple_df[staple_df["channel"] != major_channel]
+    rest_agg = aggregate_periods(other_channels_df, ["product_type"], freq) if not other_channels_df.empty else pd.DataFrame()
+    rest_series = rest_agg.sort_values("period")["actual_kg"].tolist() if not rest_agg.empty else []
+    rest_projection = project_forward_with_range(rest_series, None, n_periods=n_periods) if len(rest_series) >= 2 else pd.DataFrame()
+
     channel_shares = compute_trending_shares(other_channels_df, ["channel"], freq=freq) if not other_channels_df.empty else pd.DataFrame()
     size_shares_by_channel = {}
     for ch in staple_df["channel"].dropna().unique():
@@ -798,9 +863,17 @@ def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_cha
         staple_total_h = staple_projection["forecast_kg"].iloc[h] if h < len(staple_projection) else None
         if staple_total_h is None:
             continue
-        sr_h = sr_projection["forecast_kg"].iloc[h] if not sr_projection.empty and h < len(sr_projection) else 0
-        sr_h = min(sr_h, staple_total_h)  # sanity clamp -- SR's own forecast can't exceed Staple's total
-        remainder_h = max(staple_total_h - sr_h, 0)
+
+        sr_raw = sr_projection["forecast_kg"].iloc[h] if not sr_projection.empty and h < len(sr_projection) else 0
+        rest_raw = rest_projection["forecast_kg"].iloc[h] if not rest_projection.empty and h < len(rest_projection) else 0
+
+        # reconcile the two independent parts to the (more reliable) aggregate Staple total
+        parts_sum = sr_raw + rest_raw
+        if parts_sum > 0:
+            scale = staple_total_h / parts_sum
+            sr_h, remainder_h = sr_raw * scale, rest_raw * scale
+        else:
+            sr_h, remainder_h = 0, staple_total_h
 
         for _, row in channel_shares.iterrows():
             ch_kg = remainder_h * row["share"]
@@ -2339,6 +2412,7 @@ with tab_data:
                 mapping_to_remember.update({"units_col": units_col, "weight_col": weight_col})
             save_upload_column_defaults(mapping_to_remember)
 
+            load_sales_records.clear()  # force fresh data immediately, not a stale cache for up to 60s
             st.success(f"Saved {len(std)} records from batch '{batch_name}'. Forecast will update below.")
             st.rerun()
 
@@ -2355,6 +2429,7 @@ with tab_data:
             if st.button("Delete this batch"):
                 conn.execute("DELETE FROM sales_records WHERE upload_batch = ?", (batch_to_delete,))
                 conn.commit()
+                load_sales_records.clear()  # same reason as the upload path -- avoid a stale cache after deletion
 
                 # real cleanup, not just a disclosed limitation -- figure out what the latest
                 # actual week is NOW that this batch is gone, and remove any frozen forecasts
@@ -2573,6 +2648,20 @@ with tab_forecast:
             conn.commit()
             st.warning("Override turned off — reverting to the auto forecast.")
             st.rerun()
+
+    # surface ongoing overrides that real actuals have consistently contradicted -- an
+    # ongoing override never expires on its own (by design), so without this a stale one
+    # could quietly distort numbers indefinitely with nobody noticing
+    stale_flags = check_stale_ongoing_overrides(weekly_actual, active_overrides)
+    if stale_flags:
+        st.warning(f"{len(stale_flags)} ongoing override(s) look out of step with recent actuals — worth a check.")
+        stale_df = pd.DataFrame(stale_flags).rename(columns={
+            "override_kg": "Override (kg)", "recent_avg_actual_kg": "Recent avg actual (kg)",
+            "off_by_pct": "Off by %", "weeks_checked": "Weeks checked"})
+        st.dataframe(stale_df, use_container_width=True, hide_index=True)
+        st.caption("These aren't removed automatically — an ongoing override may still be correct "
+                   "(e.g. a real, permanent change in how an account orders). This is a prompt to "
+                   "confirm it's still right, not an instruction to delete it.")
 
     # real history, not just what's currently active -- turning an override off updates its
     # status but never deletes the record, yet nowhere in the app previously showed that

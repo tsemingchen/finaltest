@@ -1222,6 +1222,24 @@ def walk_forward_segment(segment_df, n_periods=12, freq="W"):
 
 
 @st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def walk_forward_all_segments(sales_df, n_periods=12, freq="W"):
+    """Whole-company walk-forward history, built by summing the SAME three per-segment
+    calculations the segment tables show. Real bug this fixes: the Overview chart was still
+    using the older two-group (Single + Staple) walk-forward while the segment tables had
+    moved to three groups -- two different calculations for the same thing, which is exactly
+    how the chart ended up showing roughly double what the segments summed to. Routing both
+    through this one function makes them agree by construction, not by coincidence."""
+    frames = []
+    for label, seg_df in split_into_segments(sales_df).items():
+        wf = walk_forward_segment(seg_df, n_periods=n_periods, freq=freq)
+        if not wf.empty:
+            frames.append(wf)
+    if not frames:
+        return pd.DataFrame(columns=["period", "forecast_kg"])
+    return pd.concat(frames, ignore_index=True).groupby("period", as_index=False)["forecast_kg"].sum()
+
+
+@st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def walk_forward_topdown(sales_df, n_periods=12, freq="W", product_type=None):
     """The ONE walk-forward historical-forecast calculation, shared by both the Overview
     chart and the Staple/Single table -- fixes a real inconsistency: the Overview chart used
@@ -1588,11 +1606,18 @@ with tab_dash:
             company_weekly = d_kpi.groupby("week_start")["kg"].sum().sort_index()
             weeks_list = company_weekly.index.tolist()
 
+            # measure accuracy against the SAME segment-based forecast the rest of the
+            # dashboard shows. Real bug: this used to fit one whole-company aggregate model
+            # of its own, which is a third distinct method -- so the accuracy number was
+            # grading a forecast that appeared nowhere else in the app.
+            acc_wf = walk_forward_all_segments(sales_df, n_periods=6, freq="W")
+            acc_map = dict(zip(acc_wf["period"], acc_wf["forecast_kg"])) if not acc_wf.empty else {}
+
             def _week_accuracy(idx):
-                if idx < 2:
+                if idx < 0 or idx >= len(weeks_list):
                     return None
-                history_before = company_weekly.iloc[:idx].tolist()
-                f = trend_forecast(history_before)
+                wk = weeks_list[idx]
+                f = acc_map.get(wk)
                 actual = company_weekly.iloc[idx]
                 if f is None or f <= 0:
                     return None
@@ -1655,7 +1680,7 @@ with tab_dash:
         # (top-down). Different methods, no reason to agree. Now both call the exact same
         # function, so they can't drift apart again.
         wf_freq = "W" if trend_freq == "Week" else "M"
-        topdown_bt = walk_forward_topdown(sales_df, n_periods=26, freq=wf_freq)
+        topdown_bt = walk_forward_all_segments(sales_df, n_periods=26, freq=wf_freq)
         total_bt = trend_agg.rename(columns={"period": "week_start", "kg": "actual_kg"}).merge(
             topdown_bt.rename(columns={"period": "week_start"}), on="week_start", how="inner")
         total_bt["variance_pct"] = (total_bt["actual_kg"] - total_bt["forecast_kg"]) / total_bt["forecast_kg"].replace(0, np.nan)

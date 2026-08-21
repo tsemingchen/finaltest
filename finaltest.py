@@ -1197,6 +1197,31 @@ def compute_shares(sales_df, group_cols, recent_days=120):
 
 
 @st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def walk_forward_segment(segment_df, n_periods=12, freq="W"):
+    """Walk-forward historical forecast for an ALREADY-FILTERED segment dataframe.
+
+    Takes the segment's own rows directly rather than a product_type label. Real bug this
+    fixes: when the dashboard moved from two product types to three segments, the labels
+    became things like "Staple — Specialty Retail", which matched no actual product_type
+    value -- so both Staple segments silently showed blank forecasts while Single (whose
+    label happens to equal a real product_type) still worked.
+
+    For each of the last n_periods, forecasts that period using ONLY the data from before
+    it -- no peeking at the answer. Returns a DataFrame with columns: period, forecast_kg."""
+    if segment_df is None or segment_df.empty:
+        return pd.DataFrame(columns=["period", "forecast_kg"])
+    agg = aggregate_periods(segment_df, ["product_type"], freq)
+    agg = agg.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period").reset_index(drop=True)
+    rows = []
+    for i in range(max(len(agg) - n_periods, 2), len(agg)):
+        history_before = agg["actual_kg"].iloc[:i].tolist()
+        f = trend_forecast(history_before)
+        if f is not None:
+            rows.append({"period": agg["period"].iloc[i], "forecast_kg": f})
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["period", "forecast_kg"])
+
+
+@st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def walk_forward_topdown(sales_df, n_periods=12, freq="W", product_type=None):
     """The ONE walk-forward historical-forecast calculation, shared by both the Overview
     chart and the Staple/Single table -- fixes a real inconsistency: the Overview chart used
@@ -1773,7 +1798,7 @@ with tab_dash:
                         # was its own separate inline implementation, which is exactly how the
                         # two views could drift apart again even after being fixed once. One
                         # function, called from both places, is what actually prevents that.
-                        wf = walk_forward_topdown(sales_df, n_periods=n_history_shown, freq="W", product_type=pt)
+                        wf = walk_forward_segment(pt_df, n_periods=n_history_shown, freq="W")
                         stored_by_week = wf.rename(columns={"period": "Period", "forecast_kg": "Forecast (kg)"})
                         recent_actual = recent_actual.merge(stored_by_week, on="Period", how="left")
                     else:

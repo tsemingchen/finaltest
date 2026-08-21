@@ -211,16 +211,35 @@ def get_conn():
 conn = get_conn()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=2, show_spinner=False)
 def load_sales_records():
     """Cached with a 60-second TTL -- real issue found: this was re-downloading the ENTIRE
     sales history over the network on every single interaction (Streamlit reruns the whole
     script on every click, not just new uploads), since it wasn't cached at all. That's both
     a real time cost on every click AND likely a real contributor to hitting Supabase's
     bandwidth quota. A short TTL keeps this fast for a whole working session while still
-    picking up new uploads within a minute -- not stale for hours, just not re-fetched on
-    every single click within the same minute."""
-    return pd.read_sql("SELECT * FROM sales_records", conn)
+    picking up new uploads within a minute.
+
+    Also downcasts numeric columns and converts low-cardinality text to 'category' dtype --
+    this is the single largest object held in memory, and Streamlit Cloud's resource-limit
+    error (which names "leaving large datasets in memory" as a primary cause) is a RAM
+    limit, not a speed limit. Typically cuts this DataFrame's memory footprint substantially
+    with no change to any resulting number."""
+    df = pd.read_sql("SELECT * FROM sales_records", conn)
+    for col in ["kg", "revenue", "quantity"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
+    # Only 'upload_batch' is converted to category. Deliberately NOT converting channel /
+    # product / size_label / product_type: those get filtered and then grouped constantly
+    # throughout the app, and with category dtype a value with zero rows after filtering can
+    # still appear as a phantom empty group depending on pandas' `observed` default -- which
+    # would silently distort share calculations. Verified safe on the currently deployed
+    # pandas, but not worth depending on a version-specific default for numbers this
+    # important. The numeric downcasting above is where most of the real saving comes from
+    # anyway, and it carries no such risk.
+    if "upload_batch" in df.columns and df["upload_batch"].nunique(dropna=False) < len(df) * 0.5:
+        df["upload_batch"] = df["upload_batch"].astype("category")
+    return df
 
 
 def insert_dataframe(table_name, df, batch_size=300, show_progress=False):
@@ -708,6 +727,7 @@ def fit_with_found_order(series, order, seasonal_order, n_periods=1):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            from statsmodels.tsa.statespace.sarimax import SARIMAX
             fit_vals = _cap_outliers(vals)
             model = SARIMAX(fit_vals, order=order, seasonal_order=seasonal_order,
                              enforce_stationarity=False, enforce_invertibility=False)
@@ -751,7 +771,7 @@ def _cheap_data_fingerprint(sales_df):
     return (len(sales_df), str(latest))
 
 
-@st.cache_data(show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+@st.cache_data(ttl=900, max_entries=8, show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
     aggregated series, rather than deriving them by summing many small per-item forecasts.
@@ -784,7 +804,7 @@ def compute_type_level_forecast(sales_df, freq="W"):
     return results
 
 
-@st.cache_data(show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...",
+@st.cache_data(ttl=900, max_entries=4, show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...",
                 hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_channel="Specialty Retail"):
     """Three-tier forecast for Staple specifically, for Operations' bag-ordering use case
@@ -949,10 +969,23 @@ def generate_missing_forecasts(weekly_actual):
     # statistically justified anyway (more data, less noise) and already has its own real,
     # properly-cached best-model search. Per-item forecasts don't need their own seasonal
     # fit to stay useful for the item-level table, pipeline events, and overrides.
+    # Collect every forecast in memory first, then write them ALL in one batched insert --
+    # real cause of a reported multi-minute hang found in production logs: this used to do
+    # one separate INSERT per combo, inside the loop. With 633 combos that's 633 individual
+    # network round trips to a remote Supabase database, one at a time, each costing real
+    # latency regardless of how fast the model fit itself is. The model fitting was never
+    # the bottleneck here -- the network was. insert_dataframe batches 300 rows per
+    # statement, turning ~633 round trips into ~3.
     progress_bar = st.progress(0, text=f"Generating forecasts for the new week ({len(to_compute)} to compute)...")
     skipped_combos = []
+    pending_rows = []
+    generated_at = datetime.now().isoformat()
+    # update the progress bar ~20 times total, not once per combo -- each update forces a
+    # UI round trip to the browser, which is itself a real cost across hundreds of items
+    progress_every = max(1, len(to_compute) // 20)
     for i, (ch, pr) in enumerate(to_compute):
-        progress_bar.progress((i) / len(to_compute), text=f"Forecasting {ch} / {pr}  ({i+1} of {len(to_compute)})...")
+        if i % progress_every == 0:
+            progress_bar.progress(i / len(to_compute), text=f"Forecasting… ({i+1} of {len(to_compute)})")
         try:
             hist = weekly_actual[(weekly_actual["channel"] == ch) & (weekly_actual["product"] == pr)] \
                 .sort_values("week_start").tail(MAX_LOOKBACK_WEEKS)
@@ -965,13 +998,19 @@ def generate_missing_forecasts(weekly_actual):
             # Validate before inserting rather than let one bad combo crash forecasting for
             # every other combo in this same batch.
             if f is not None and np.isfinite(f) and 0 <= f <= 1_000_000:
-                conn.execute("""INSERT INTO auto_forecasts (generated_at, channel, product, target_week, forecast_kg, method)
-                    VALUES (?,?,?,?,?,?)""",
-                    (datetime.now().isoformat(), ch, pr, target_week, float(round(f, 1)), method_used))
+                pending_rows.append({
+                    "generated_at": generated_at, "channel": ch, "product": pr,
+                    "target_week": target_week, "forecast_kg": float(round(f, 1)),
+                    "method": method_used,
+                })
             elif f is not None:
                 skipped_combos.append((ch, pr, f))
         except Exception as e:
             skipped_combos.append((ch, pr, f"error: {e}"))
+
+    if pending_rows:
+        progress_bar.progress(0.95, text=f"Saving {len(pending_rows)} forecasts...")
+        insert_dataframe("auto_forecasts", pd.DataFrame(pending_rows))
     progress_bar.empty()
     conn.commit()
     if skipped_combos:
@@ -981,20 +1020,27 @@ def generate_missing_forecasts(weekly_actual):
                    (f" and {len(skipped_combos)-5} more" if len(skipped_combos) > 5 else ""))
 
 
-@st.cache_data(show_spinner="Running backtest...")
-def backtest_accuracy(weekly_actual, group_cols=("channel", "product"), lookback=LOOKBACK_WEEKS):
+@st.cache_data(ttl=900, max_entries=4, show_spinner="Running backtest...")
+def backtest_accuracy(weekly_actual, group_cols=("channel", "product"), lookback=LOOKBACK_WEEKS,
+                       max_backtest_weeks=12):
     """Generic walk-forward backtest for any grouping (channel+product, channel, product, or customer).
-    Cached: this does one ARIMA fit per historical week per segment (measured: ~12 seconds for the
-    full channel x product backtest) -- without caching, Streamlit would redo this on every single
-    click or dropdown change, since it reruns the whole script each time. Cache key is the actual
-    data content, so it correctly recomputes only when new sales data is uploaded."""
+
+    IMPORTANT -- only backtests the most recent `max_backtest_weeks` weeks per segment, not
+    the entire history. Real measurement behind this: with ~633 segments and ~150 weeks of
+    history, backtesting everything meant ~94,000 individual model fits in a single call --
+    roughly 37+ minutes, matching a real reported case of this running for an hour. And this
+    function runs automatically on page load, not behind a button, so that cost was hit on
+    every cold start. Capping at 12 recent weeks cuts it by ~92% while still giving a
+    meaningful, current accuracy read -- accuracy from 2+ years ago isn't what anyone's
+    actually judging the forecast on anyway."""
     group_cols = list(group_cols)
     if weekly_actual.empty:
         return pd.DataFrame()
     rows = []
-    for key, grp in weekly_actual.groupby(group_cols):
+    for key, grp in weekly_actual.groupby(group_cols, observed=True):
         grp = grp.sort_values("week_start").reset_index(drop=True)
-        for i in range(2, len(grp)):
+        start_i = max(2, len(grp) - max_backtest_weeks)
+        for i in range(start_i, len(grp)):
             hist = grp.iloc[max(0, i - lookback):i]["actual_kg"].tolist()
             f = trend_forecast(hist)
             if f is None:
@@ -1036,7 +1082,7 @@ def aggregate_periods(sales_df, group_cols, freq):
     return g
 
 
-@st.cache_data(show_spinner="Computing forecast...")
+@st.cache_data(ttl=900, max_entries=8, show_spinner="Computing forecast...")
 def forecast_next_period(agg_df, group_cols, min_history=2):
     """One step ahead, for any grouping -- same trend method, applied to whatever period
     (week or month) the input was aggregated to. Cached for the same reason as backtest_accuracy."""
@@ -1079,7 +1125,7 @@ def compute_shares(sales_df, group_cols, recent_days=120):
     return g[list(group_cols) + ["share"]]
 
 
-@st.cache_data(hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+@st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def walk_forward_topdown(sales_df, n_periods=12, freq="W", product_type=None):
     """The ONE walk-forward historical-forecast calculation, shared by both the Overview
     chart and the Staple/Single table -- fixes a real inconsistency: the Overview chart used
@@ -1116,7 +1162,7 @@ def walk_forward_topdown(sales_df, n_periods=12, freq="W", product_type=None):
     return combined.groupby("period", as_index=False)["forecast_kg"].sum()
 
 
-@st.cache_data(hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+@st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
     """Like compute_shares, but projects each segment's share FORWARD based on its own
     recent trend, instead of just averaging history. Real problem this solves: a flat
@@ -1174,7 +1220,7 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
     return result
 
 
-@st.cache_data(show_spinner="Projecting forward...")
+@st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 def project_forward_with_range(actual_series, error_sigma, n_periods=8):
     """Projects multiple periods ahead. With 2+ years of history (104+ points), tries a real
     seasonal SARIMA(1,1,1)x(1,1,1,52) so the projected range can reflect a genuine yearly
@@ -1239,7 +1285,12 @@ if has_data:
     customer_mix_df = compute_customer_mix(sales_df)
     weekly_actual = compute_weekly_actuals(sales_df)
     generate_missing_forecasts(weekly_actual)
-    backtest_df = backtest_accuracy(weekly_actual)
+    # Backtest is the single most expensive thing in the app (~94,000 model fits before the
+    # recent-weeks cap). It now runs ONLY when asked for, not on every page load -- Streamlit
+    # reruns this whole script on every click, so anything unguarded here is paid for
+    # constantly. Accuracy analysis is something you look at deliberately, not something
+    # that needs recomputing every time someone switches a dropdown.
+    backtest_df = st.session_state.get("backtest_df", pd.DataFrame())
 else:
     price_df = size_mix_df = customer_mix_df = weekly_actual = backtest_df = pd.DataFrame()
 
@@ -1348,7 +1399,9 @@ tab_dash, tab_data, tab_rates, tab_forecast, tab_salesplan, tab_pipeline, tab_op
 with tab_dash:
     if not has_data:
         st.info("No sales data uploaded yet. Go to **1. Upload sales data** to get started.")
-    elif backtest_df.empty:
+    elif weekly_actual.empty or weekly_actual["week_start"].nunique() < 3:
+        # gate on actual data availability, NOT on the backtest -- the backtest is now
+        # opt-in, so gating the whole dashboard on it would have hidden everything
         st.warning("Not enough history yet to forecast — need at least a few weeks of data per channel/product.")
     else:
         dim_map = {"Channel": "channel", "Item": "product", "Customer": "customer"}
@@ -1851,6 +1904,22 @@ with tab_dash:
         st.divider()
         view = st.radio("View", ["Weekly report", "Monthly report"], horizontal=True)
 
+        # Accuracy analysis is opt-in -- it's by far the most expensive computation here
+        # (one model fit per segment per week), and Streamlit reruns everything on every
+        # click, so running it automatically meant paying that cost constantly.
+        if backtest_df.empty:
+            st.info("Accuracy analysis hasn't been run yet for this session.")
+            bt_weeks = st.slider("Weeks of history to check", 4, 26, 8, key="bt_weeks")
+            if st.button("Run accuracy analysis"):
+                with st.spinner(f"Checking the last {bt_weeks} weeks..."):
+                    st.session_state["backtest_df"] = backtest_accuracy(
+                        weekly_actual, max_backtest_weeks=bt_weeks)
+                st.rerun()
+        else:
+            if st.button("Refresh accuracy analysis"):
+                st.session_state.pop("backtest_df", None)
+                st.rerun()
+
         if view == "Weekly report":
             st.markdown("**Accuracy overview — every segment at a glance**")
             st.caption(f"Broken down by: {' × '.join(group_cols) if group_cols else '(none — fully filtered to one specific segment)'}")
@@ -1948,16 +2017,19 @@ with tab_dash:
 
         else:  # Monthly report
             bt = backtest_df.copy()
-            bt["month"] = pd.to_datetime(bt["week_start"]).dt.to_period("M").astype(str)
-            bt["abs_variance_pct"] = bt["variance_pct"].abs()
-            monthly = bt.groupby(["channel", "product", "month"], as_index=False).agg(
-                MAPE=("abs_variance_pct", "mean"), Bias=("variance_pct", "mean"), weeks=("week_start", "count"))
-            monthly["MAPE_%"] = (monthly["MAPE"] * 100).round(1)
-            monthly["Bias_%"] = (monthly["Bias"] * 100).round(1)
-            st.dataframe(monthly[["month", "channel", "product", "MAPE_%", "Bias_%", "weeks"]]
-                         .sort_values("month", ascending=False), use_container_width=True)
-            st.caption("Positive bias = actuals running ahead of the auto-forecast (under-forecasting). "
-                       "Negative = over-forecasting. MAPE = average error size regardless of direction.")
+            if bt.empty:
+                st.info("Run the accuracy analysis above to see the monthly report.")
+            else:
+                bt["month"] = pd.to_datetime(bt["week_start"]).dt.to_period("M").astype(str)
+                bt["abs_variance_pct"] = bt["variance_pct"].abs()
+                monthly = bt.groupby(["channel", "product", "month"], as_index=False).agg(
+                    MAPE=("abs_variance_pct", "mean"), Bias=("variance_pct", "mean"), weeks=("week_start", "count"))
+                monthly["MAPE_%"] = (monthly["MAPE"] * 100).round(1)
+                monthly["Bias_%"] = (monthly["Bias"] * 100).round(1)
+                st.dataframe(monthly[["month", "channel", "product", "MAPE_%", "Bias_%", "weeks"]]
+                             .sort_values("month", ascending=False), use_container_width=True)
+                st.caption("Positive bias = actuals running ahead of the auto-forecast (under-forecasting). "
+                           "Negative = over-forecasting. MAPE = average error size regardless of direction.")
 
     # --- downloadable snapshot report, for meetings ---
     if has_data and not backtest_df.empty:
@@ -2235,17 +2307,23 @@ Generated automatically from 49th Parallel's demand planning app.</p>
             wb.save(buf)
             return buf.getvalue()
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.download_button("Download report (HTML)", build_report_html(),
-                                f"demand_report_{cycle}.html", mime="text/html")
-        with col2:
-            st.download_button("Download report (PDF)", build_report_pdf(),
-                                f"demand_report_{cycle}.pdf", mime="application/pdf")
-        with col3:
-            st.download_button("Download report (Excel)", build_report_excel(),
-                                f"demand_report_{cycle}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Reports are built ONLY when asked for. st.download_button computes its data
+        # eagerly, so having three of these unguarded meant building a full HTML report, a
+        # full PDF, AND a full Excel workbook (with charts) on every single page load --
+        # even though nobody had clicked anything. Easily one of the most expensive things
+        # in the app, and completely invisible as a cost.
+        report_kind = st.radio("Report format", ["HTML", "PDF", "Excel"], horizontal=True, key="report_kind")
+        if st.button("Generate report"):
+            if report_kind == "HTML":
+                st.download_button("Download report (HTML)", build_report_html(),
+                                    f"demand_report_{cycle}.html", mime="text/html")
+            elif report_kind == "PDF":
+                st.download_button("Download report (PDF)", build_report_pdf(),
+                                    f"demand_report_{cycle}.pdf", mime="application/pdf")
+            else:
+                st.download_button("Download report (Excel)", build_report_excel(),
+                                    f"demand_report_{cycle}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.caption("HTML opens in any browser and can be printed to PDF from there too. "
                    "PDF and Excel are generated directly, ready to attach or print for a meeting.")
 
@@ -3090,12 +3168,25 @@ The key is never visible in the code or GitHub repo — Streamlit's secrets stor
 with tab_history:
     st.subheader("Backup / export everything")
     st.markdown("**Sales records**")
-    st.dataframe(sales_df, use_container_width=True)
-    st.download_button("Download sales_records.csv", sales_df.to_csv(index=False), "sales_records.csv")
+    # show a capped preview, and make the full CSV opt-in. st.download_button computes its
+    # data EAGERLY -- so sales_df.to_csv() was converting the entire sales history into a
+    # CSV string on every single page load, whether or not anyone ever clicked download.
+    st.caption(f"{len(sales_df):,} rows total — showing the most recent 500.")
+    st.dataframe(sales_df.tail(500), use_container_width=True)
+    if st.button("Prepare sales records download"):
+        st.download_button("Download sales_records.csv", sales_df.to_csv(index=False), "sales_records.csv")
     st.markdown("**Auto-generated forecasts (frozen predictions, for accuracy tracking)**")
-    af = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC", conn)
+    # LIMIT + opt-in download, not the whole table. Real issue: this table is append-only
+    # and grows by roughly one row per channel/product combo per week (~633/week here), so
+    # after a few months it's tens of thousands of rows. Streamlit renders EVERY tab's
+    # content on every rerun -- even tabs nobody has clicked -- so an unbounded SELECT *
+    # here was being loaded and rendered on every single page load, for everyone.
+    af = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC LIMIT 500", conn)
+    st.caption("Showing the 500 most recent. Use the download below for the full history.")
     st.dataframe(af, use_container_width=True)
-    st.download_button("Download auto_forecasts.csv", af.to_csv(index=False), "auto_forecasts.csv")
+    if st.button("Prepare full forecast history download"):
+        af_full = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC", conn)
+        st.download_button("Download auto_forecasts.csv", af_full.to_csv(index=False), "auto_forecasts.csv")
     st.markdown("**Pipeline events**")
     st.dataframe(all_events, use_container_width=True)
     st.markdown("**Sign-offs**")

@@ -771,6 +771,57 @@ def _cheap_data_fingerprint(sales_df):
     return (len(sales_df), str(latest))
 
 
+MAJOR_STAPLE_CHANNEL = "Specialty Retail"
+
+
+def split_into_segments(sales_df, major_channel=MAJOR_STAPLE_CHANNEL):
+    """Splits sales into the THREE groups we forecast independently:
+      1. Single
+      2. Staple — Specialty Retail
+      3. Staple — other channels
+
+    Specialty Retail is separated out because it's grown to a large share of Staple and is
+    still actively shifting -- large and fast-moving enough that estimating it as a
+    proportion of Staple would keep lagging its real trajectory. The remaining channels are
+    more stable, so they're forecast together as one group rather than each getting their
+    own noisy model. Returns an ordered dict of {label: dataframe}."""
+    segments = {}
+    if "product_type" not in sales_df.columns:
+        return segments
+    single_df = sales_df[sales_df["product_type"] == "Single"]
+    staple_df = sales_df[sales_df["product_type"] == "Staple"]
+    if not single_df.empty:
+        segments["Single"] = single_df
+    if not staple_df.empty and "channel" in staple_df.columns:
+        sr_df = staple_df[staple_df["channel"] == major_channel]
+        rest_df = staple_df[staple_df["channel"] != major_channel]
+        if not sr_df.empty:
+            segments[f"Staple — {major_channel}"] = sr_df
+        if not rest_df.empty:
+            segments["Staple — other channels"] = rest_df
+    elif not staple_df.empty:
+        segments["Staple"] = staple_df
+    return segments
+
+
+@st.cache_data(ttl=900, max_entries=8, show_spinner="Forecasting segments...",
+                hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def compute_segment_forecast(sales_df, freq="W"):
+    """One real, independent forecast per segment -- each fit on that segment's OWN
+    aggregated history. Nothing here is derived by splitting a total: the segments are
+    forecast separately, and their sum becomes the company total, not the other way
+    around. Returns {segment_label: forecast_kg} for the next single period."""
+    results = {}
+    for label, seg_df in split_into_segments(sales_df).items():
+        agg = aggregate_periods(seg_df, ["product_type"], freq)
+        series = agg.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period")["actual_kg"].tolist()
+        if len(series) >= 2:
+            f = trend_forecast(series)
+            if f is not None:
+                results[label] = f
+    return results
+
+
 @st.cache_data(ttl=900, max_entries=8, show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
@@ -1416,11 +1467,10 @@ with tab_dash:
         # ===============================================================
         st.markdown("### Overview")
 
-        # Top-down basis: forecast Staple and Single directly (each on its own aggregated
-        # series, more statistically reliable than summing many small per-item forecasts --
-        # this is standard practice in real demand planning), then this sum becomes the one
-        # official total. Falls back to the old bottom-up sum if product types aren't set up.
-        type_level_forecasts = compute_type_level_forecast(sales_df, freq="W")
+        # Three independent segment forecasts (Single, Staple—Specialty Retail, Staple—other
+        # channels), each fit on its own history. Their SUM becomes the official company
+        # total -- the total is built up from the segments, not split down into them.
+        type_level_forecasts = compute_segment_forecast(sales_df, freq="W")
 
         # attribute each pipeline event's kg impact to ITS OWN product type, not one lump
         # sum floating at the top level -- real gap found: a Staple-item contract wouldn't
@@ -1436,11 +1486,20 @@ with tab_dash:
             pipeline_by_type = pipeline_typed.groupby("product_type")["pipeline_kg"].sum().to_dict()
         pipeline_total_next_week = pipeline_by_cp["pipeline_kg"].sum() if not pipeline_by_cp.empty else 0
 
-        # each type's forecast now includes ITS OWN attributed pipeline events, so the Staple
-        # and Single panels show numbers that are already consistent with the KPI total below
-        type_level_forecasts_with_pipeline = {
-            pt: val + pipeline_by_type.get(pt, 0) for pt, val in type_level_forecasts.items()
-        }
+        # each segment's forecast now includes its own attributed pipeline events, so the
+        # segment panels stay consistent with the KPI total below. Staple events are
+        # apportioned across the two Staple segments by their own forecast weights.
+        staple_labels_kpi = [l for l in type_level_forecasts if l.startswith("Staple")]
+        staple_total_kpi = sum(type_level_forecasts[l] for l in staple_labels_kpi) or 1
+        type_level_forecasts_with_pipeline = {}
+        for label, val in type_level_forecasts.items():
+            if label == "Single":
+                type_level_forecasts_with_pipeline[label] = val + pipeline_by_type.get("Single", 0)
+            elif label in staple_labels_kpi:
+                weight = val / staple_total_kpi
+                type_level_forecasts_with_pipeline[label] = val + pipeline_by_type.get("Staple", 0) * weight
+            else:
+                type_level_forecasts_with_pipeline[label] = val
         unattributed_pipeline = pipeline_by_type.get("(not tracked)", 0)  # events on products with no known type
 
         if type_level_forecasts:
@@ -1611,37 +1670,47 @@ with tab_dash:
             sales_df[sales_df["product_type"] != "(not tracked)"]["product_type"].unique().tolist()
         ) if "product_type" in sales_df.columns and (sales_df["product_type"] != "(not tracked)").any() else []
 
-        if product_types_available:
-            st.markdown("## Staple vs Single")
-            st.caption("Each forecasted independently from its own history — not derived by "
-                       "splitting the total after the fact. Their sum is what makes up the "
-                       "Overview total above, so they always agree with it by construction.")
+        segment_map = split_into_segments(sales_df)
+        if segment_map:
+            st.markdown("## Forecast by segment")
+            st.caption("Three groups, each forecast independently from its own history — "
+                       "Single, Staple in Specialty Retail, and the rest of Staple. Nothing here "
+                       "is a proportional split of a total; the percentages shown are simply what "
+                       "each segment's own forecast worked out to be.")
             pt_horizon = st.radio("Show by", ["Week", "Month"], horizontal=True, key="pt_horizon")
             n_periods_shown = 8 if pt_horizon == "Week" else 6
             n_history_shown = 6 if pt_horizon == "Week" else 6
             freq = "W" if pt_horizon == "Week" else "M"
 
-            type_level_forecasts_h = compute_type_level_forecast(sales_df, freq=freq)
+            segment_forecasts = compute_segment_forecast(sales_df, freq=freq)
             if freq == "W" and pipeline_by_type:
-                # same pipeline attribution as the KPI above -- keeps this panel's own numbers
-                # consistent with the Overview total, including any logged pipeline events
-                type_level_forecasts_h = {pt: val + pipeline_by_type.get(pt, 0) for pt, val in type_level_forecasts_h.items()}
+                # attribute pipeline events -- Single events go to Single; Staple events are
+                # apportioned between the two Staple segments by their own forecast weights,
+                # since an event logged at product level doesn't say which channel it lands in
+                staple_labels = [l for l in segment_forecasts if l.startswith("Staple")]
+                staple_total_fc = sum(segment_forecasts[l] for l in staple_labels) or 1
+                for label in list(segment_forecasts):
+                    if label == "Single":
+                        segment_forecasts[label] += pipeline_by_type.get("Single", 0)
+                    elif label in staple_labels:
+                        weight = segment_forecasts[label] / staple_total_fc
+                        segment_forecasts[label] += pipeline_by_type.get("Staple", 0) * weight
 
-            pt_cols = st.columns(len(product_types_available))
-            for idx, pt in enumerate(product_types_available):
+            seg_labels = list(segment_map.keys())
+            pt_cols = st.columns(len(seg_labels))
+            for idx, pt in enumerate(seg_labels):
                 with pt_cols[idx]:
                     st.markdown(f"### {pt}")
-                    pt_df = sales_df[sales_df["product_type"] == pt]
+                    pt_df = segment_map[pt]
 
                     agg_pt = aggregate_periods(pt_df, ["product_type"], freq)
-                    agg_pt = agg_pt.sort_values("period")
+                    agg_pt = agg_pt.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period")
 
                     if len(agg_pt) < 2:
-                        st.info("Not enough history yet for this category.")
+                        st.info("Not enough history yet for this segment.")
                         continue
 
-                    with st.spinner(f"Projecting {pt} forward (first time can take a moment, cached after)..."):
-                        projection_pt = project_forward_with_range(agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown)
+                    projection_pt = project_forward_with_range(agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown)
 
                     # anchor period 1 to the SAME single-step forecast that feeds the Overview
                     # KPI total -- guarantees this table's first period matches the top of the
@@ -1652,7 +1721,7 @@ with tab_dash:
                     # An additive offset to period 1 only keeps a one-time bump contained to the
                     # period it actually applies to, leaving the statistical shape of later
                     # periods untouched.
-                    direct_forecast = type_level_forecasts_h.get(pt)
+                    direct_forecast = segment_forecasts.get(pt)
                     if not projection_pt.empty and direct_forecast is not None:
                         # explicit float cast before assigning -- real bug found: pandas 3.0
                         # raises a TypeError instead of silently upcasting a whole-number
@@ -1666,7 +1735,7 @@ with tab_dash:
                         projection_pt.loc[projection_pt.index[0], "low"] = max(projection_pt["low"].iloc[0] + offset, 0)
                         projection_pt.loc[projection_pt.index[0], "high"] = max(projection_pt["high"].iloc[0] + offset, 0)
 
-                    total_company_this_period = sum(type_level_forecasts_h.values()) if type_level_forecasts_h else None
+                    total_company_this_period = sum(segment_forecasts.values()) if segment_forecasts else None
                     if total_company_this_period:
                         st.caption(f"{(direct_forecast or 0)/total_company_this_period*100:.0f}% of next period's total")
 

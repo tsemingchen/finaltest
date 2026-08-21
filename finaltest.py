@@ -793,8 +793,14 @@ def split_into_segments(sales_df, major_channel=MAJOR_STAPLE_CHANNEL):
     if not single_df.empty:
         segments["Single"] = single_df
     if not staple_df.empty and "channel" in staple_df.columns:
-        sr_df = staple_df[staple_df["channel"] == major_channel]
-        rest_df = staple_df[staple_df["channel"] != major_channel]
+        # match the channel case-insensitively and ignoring stray whitespace -- an exact-match
+        # miss here would silently collapse this back to two segments, which is confusing and
+        # hard to spot
+        chan_norm = staple_df["channel"].astype(str).str.strip().str.casefold()
+        target = str(major_channel).strip().casefold()
+        is_major = chan_norm == target
+        sr_df = staple_df[is_major]
+        rest_df = staple_df[~is_major]
         if not sr_df.empty:
             segments[f"Staple — {major_channel}"] = sr_df
         if not rest_df.empty:
@@ -1697,6 +1703,11 @@ with tab_dash:
                         segment_forecasts[label] += pipeline_by_type.get("Staple", 0) * weight
 
             seg_labels = list(segment_map.keys())
+            if len(seg_labels) < 3:
+                st.warning(
+                    f"Only {len(seg_labels)} segment(s) found: {', '.join(seg_labels)}. "
+                    f"Expected three (Single, Staple — {MAJOR_STAPLE_CHANNEL}, Staple — other channels). "
+                    "This usually means the channel name doesn't match, or one group has no data.")
             pt_cols = st.columns(len(seg_labels))
             for idx, pt in enumerate(seg_labels):
                 with pt_cols[idx]:

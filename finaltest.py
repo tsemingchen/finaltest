@@ -1516,11 +1516,17 @@ if not forecast_by_cp.empty and not size_mix_df.empty:
     _kg_per_bag = compute_kg_per_bag(sales_df)
     if not _kg_per_bag.empty:
         translated = translated.merge(_kg_per_bag, on="size_label", how="left")
-        translated["forecast_bags"] = np.ceil(
-            translated["forecast_kg"] / translated["kg_per_bag"].replace(0, np.nan)).astype("Float64")
+        # force plain float64 on both sides before dividing. Real bug: after the merge these
+        # could be nullable (Float64) or downcast (float32) dtypes, and np.ceil raises a
+        # ValueError on those rather than handling them. Converting explicitly keeps NaN
+        # behaviour predictable for sizes with no learned rate.
+        _kg = pd.to_numeric(translated["forecast_kg"], errors="coerce").astype("float64")
+        _rate = pd.to_numeric(translated["kg_per_bag"], errors="coerce").astype("float64")
+        _rate = _rate.where(_rate > 0)  # avoid divide-by-zero -> inf
+        translated["forecast_bags"] = np.ceil(_kg.div(_rate))
     else:
         translated["kg_per_bag"] = np.nan
-        translated["forecast_bags"] = pd.NA
+        translated["forecast_bags"] = np.nan
 else:
     translated = pd.DataFrame()
 
@@ -2872,7 +2878,9 @@ with tab_forecast:
                     "size_label", as_index=False).agg(
                     forecast_kg=("forecast_kg", "sum"), bags_to_order=("forecast_bags", "sum"))
                 bag_summary["forecast_kg"] = bag_summary["forecast_kg"].round(0)
-                bag_summary["bags_to_order"] = np.ceil(bag_summary["bags_to_order"].astype(float)).astype(int)
+                bag_summary["bags_to_order"] = np.ceil(
+                    pd.to_numeric(bag_summary["bags_to_order"], errors="coerce").astype("float64")
+                ).fillna(0).astype("int64")  # fillna before astype(int) -- NaN can't cast to int
                 st.dataframe(bag_summary.rename(columns={
                     "size_label": "Bag size", "forecast_kg": "Forecast (kg)",
                     "bags_to_order": "Bags to order"}), use_container_width=True, hide_index=True)

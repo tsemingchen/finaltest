@@ -1444,6 +1444,22 @@ else:
 if not live_forecast.empty or not pipeline_by_cp.empty:
     forecast_by_cp = live_forecast[["channel", "product", "forecast_kg", "target_week"]].copy() if not live_forecast.empty \
         else pd.DataFrame(columns=["channel", "product", "forecast_kg", "target_week"])
+
+    # RECONCILE the per-item forecasts to the segment-based company total, so every tab
+    # tells the same story. Real inconsistency this fixes: these per-item numbers are frozen
+    # bottom-up forecasts (one per channel/product, hundreds of them), while the Dashboard
+    # forecasts three segments directly. Summing hundreds of small independent forecasts and
+    # forecasting three aggregates are genuinely different calculations with no reason to
+    # agree -- so the Forecast (auto) tab, Ops capacity, and Ask AI were all quoting a
+    # different total than the Dashboard. Scaling every item by one shared factor keeps the
+    # relative item-level detail exactly as-is while making the total match by construction.
+    if has_data and not forecast_by_cp.empty:
+        _seg_fc = compute_segment_forecast(sales_df, freq="W")
+        _seg_total = sum(_seg_fc.values()) if _seg_fc else 0
+        _item_total = forecast_by_cp["forecast_kg"].sum()
+        if _seg_total > 0 and _item_total > 0:
+            forecast_by_cp["forecast_kg"] = forecast_by_cp["forecast_kg"] * (_seg_total / _item_total)
+
     forecast_by_cp = forecast_by_cp.merge(pipeline_by_cp, on=["channel", "product"], how="outer")
     forecast_by_cp["forecast_kg"] = forecast_by_cp["forecast_kg"].fillna(0)
     forecast_by_cp["pipeline_kg"] = forecast_by_cp["pipeline_kg"].fillna(0)
@@ -1492,6 +1508,19 @@ if not forecast_by_cp.empty and not size_mix_df.empty:
                                        on=["channel", "product"], how="left")
     translated["forecast_kg"] = (translated["forecast_kg"] * translated["size_mix_pct"].fillna(100) / 100).round(1)
     translated = translated[["channel", "product", "size_label", "forecast_kg"]]
+
+    # convert each size's forecast kg into an actual BAG COUNT -- this is the number
+    # Operations places an order with. Uses a real kg-per-bag rate learned from your own
+    # sales (total kg / total units for that size), not a value parsed from the label text,
+    # since real fill weights differ from the nominal name.
+    _kg_per_bag = compute_kg_per_bag(sales_df)
+    if not _kg_per_bag.empty:
+        translated = translated.merge(_kg_per_bag, on="size_label", how="left")
+        translated["forecast_bags"] = np.ceil(
+            translated["forecast_kg"] / translated["kg_per_bag"].replace(0, np.nan)).astype("Float64")
+    else:
+        translated["kg_per_bag"] = np.nan
+        translated["forecast_bags"] = pd.NA
 else:
     translated = pd.DataFrame()
 
@@ -1724,10 +1753,14 @@ with tab_dash:
                                             hoverinfo="skip"))
             fig_trend.add_trace(go.Scatter(x=join_x, y=join_y_mid, mode="lines", name="Forecast",
                                             line=dict(color="rgb(60,60,60)", width=2)))
-        fig_trend.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
+        fig_trend.update_layout(height=460, margin=dict(l=10, r=10, t=40, b=10), plot_bgcolor="white",
                                  xaxis_title=trend_freq, yaxis_title="Total kg (all channels/items)",
                                  hovermode="x unified", xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                                 yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"))
+                                 yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                                 # legend above the plot instead of floating inside it -- it was
+                                 # covering a meaningful chunk of the chart area
+                                 legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                             xanchor="left", x=0, font=dict(size=11)))
         st.plotly_chart(fig_trend, use_container_width=True)
 
         st.divider()
@@ -1867,8 +1900,11 @@ with tab_dash:
                         join_y_pt = [agg_pt["actual_kg"].iloc[-1]] + projection_pt["forecast_kg"].tolist()
                         fig_pt.add_trace(go.Scatter(x=join_x_pt, y=join_y_pt, mode="lines", name="Forecast (ahead)",
                                                      line=dict(color="rgb(60,60,60)", width=2)))
-                    fig_pt.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
-                                          showlegend=True, xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"))
+                    fig_pt.update_layout(height=340, margin=dict(l=10, r=10, t=46, b=10), plot_bgcolor="white",
+                                          showlegend=True, xaxis=dict(showgrid=False),
+                                          yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                                          legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                                      xanchor="left", x=0, font=dict(size=9)))
                     st.plotly_chart(fig_pt, use_container_width=True)
 
             st.divider()
@@ -2807,9 +2843,49 @@ with tab_forecast:
         total_kg = forecast_by_cp["forecast_kg"].sum()
         st.metric("Total forecast kg (next unforecasted week, all channels/products)", f"{total_kg:,.0f} kg")
 
+        # visible consensus check -- these per-item numbers are reconciled to the same
+        # segment-based total the Dashboard shows, so the two should agree. An active
+        # override deliberately breaks that tie (it replaces a number by design), so the
+        # check names that explicitly rather than looking like a bug.
+        _dash_seg = compute_segment_forecast(sales_df, freq="W")
+        _dash_total = (sum(_dash_seg.values()) if _dash_seg else 0) + \
+            (pipeline_by_cp["pipeline_kg"].sum() if not pipeline_by_cp.empty else 0)
+        if _dash_total > 0:
+            _gap = abs(total_kg - _dash_total)
+            if _gap < max(1.0, _dash_total * 0.005):
+                st.success(f"Matches the Dashboard total ({_dash_total:,.0f} kg) — every tab is using the same forecast.")
+            elif not active_overrides.empty:
+                st.info(f"Dashboard total is {_dash_total:,.0f} kg. The {_gap:,.0f} kg difference is from "
+                        f"{len(active_overrides)} active manual override(s), which deliberately replace the "
+                        "calculated number here.")
+            else:
+                st.warning(f"This total ({total_kg:,.0f} kg) doesn't match the Dashboard ({_dash_total:,.0f} kg) — "
+                           f"a {_gap:,.0f} kg gap with no active overrides to explain it. Worth a look.")
+
         if not translated.empty:
-            st.markdown("**Broken down by size**")
-            st.dataframe(translated, use_container_width=True)
+            st.markdown("**Broken down by size — with bag counts to order**")
+            has_bags = "forecast_bags" in translated.columns and translated["forecast_bags"].notna().any()
+            if has_bags:
+                # the number Operations actually orders with: total bags per size, across
+                # every channel and item. Rounded UP -- you can't order a partial bag.
+                bag_summary = translated.dropna(subset=["forecast_bags"]).groupby(
+                    "size_label", as_index=False).agg(
+                    forecast_kg=("forecast_kg", "sum"), bags_to_order=("forecast_bags", "sum"))
+                bag_summary["forecast_kg"] = bag_summary["forecast_kg"].round(0)
+                bag_summary["bags_to_order"] = np.ceil(bag_summary["bags_to_order"].astype(float)).astype(int)
+                st.dataframe(bag_summary.rename(columns={
+                    "size_label": "Bag size", "forecast_kg": "Forecast (kg)",
+                    "bags_to_order": "Bags to order"}), use_container_width=True, hide_index=True)
+                st.caption("Bag counts come from a real kg-per-bag rate computed from your own sales history "
+                           "(total kg ÷ total units for that size), rounded up — you can't order a partial bag. "
+                           "The full channel/item detail is below.")
+                with st.expander("Full detail by channel and item"):
+                    st.dataframe(translated, use_container_width=True)
+            else:
+                st.info("Showing kg only — no quantity/bag-count column was mapped on upload, so a real "
+                        "kg-per-bag rate can't be computed. Re-upload with a Quantity column mapped (tab 1) "
+                        "to get bag counts here.")
+                st.dataframe(translated, use_container_width=True)
             st.download_button("Download forecast_by_size.csv", translated.to_csv(index=False), "forecast_by_size.csv")
 
     st.divider()

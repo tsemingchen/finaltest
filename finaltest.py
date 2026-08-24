@@ -994,6 +994,61 @@ def compute_type_level_forecast(sales_df, freq="W"):
     return results
 
 
+@st.cache_data(ttl=900, max_entries=4, show_spinner="Working out bag counts...",
+                hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M"):
+    """Bag-size breakdown across EVERY segment -- Single as well as both Staple segments --
+    so Operations sees one complete ordering picture instead of Staple only.
+
+    Each segment is projected on its own history, then split by trending channel share and
+    trending bag-size share within each channel, and finally converted to bag counts using
+    the real kg-per-bag rate learned from sales. Returns channel, size_label, period,
+    forecast_kg, forecast_bags, segment."""
+    if "size_label" not in sales_df.columns:
+        return pd.DataFrame(columns=["segment", "channel", "size_label", "period", "forecast_kg", "forecast_bags"])
+
+    rows = []
+    for label, seg_df in split_into_segments(sales_df).items():
+        agg = aggregate_periods(seg_df, ["product_type"], freq)
+        agg = agg.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period")
+        series = agg["actual_kg"].tolist()
+        if len(series) < 2:
+            continue
+        proj = project_forward_with_range(series, None, n_periods=n_periods, keep_trend=(freq == "M"))
+        if proj.empty:
+            continue
+        ch_shares = compute_trending_shares(seg_df, ["channel"], freq=freq)
+        size_by_ch = {ch: compute_trending_shares(seg_df[seg_df["channel"] == ch], ["size_label"], freq=freq)
+                      for ch in seg_df["channel"].dropna().unique()}
+        last_date = pd.Timestamp(agg["period"].iloc[-1])
+        for h in range(n_periods):
+            if h >= len(proj):
+                break
+            period_label = (last_date + pd.DateOffset(months=h + 1)).date().isoformat() if freq == "M" \
+                else (last_date + pd.Timedelta(weeks=h + 1)).date().isoformat()
+            seg_total = proj["forecast_kg"].iloc[h]
+            for _, chrow in ch_shares.iterrows():
+                ch_kg = seg_total * chrow["share"]
+                for _, srow in size_by_ch.get(chrow["channel"], pd.DataFrame()).iterrows():
+                    rows.append({"segment": label, "channel": chrow["channel"],
+                                 "size_label": srow["size_label"], "period": period_label,
+                                 "forecast_kg": ch_kg * srow["share"]})
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    kg_per_bag = compute_kg_per_bag(sales_df)
+    if not kg_per_bag.empty:
+        result = result.merge(kg_per_bag, on="size_label", how="left")
+        _kg = pd.to_numeric(result["forecast_kg"], errors="coerce").astype("float64")
+        _rate = pd.to_numeric(result["kg_per_bag"], errors="coerce").astype("float64").where(lambda s: s > 0)
+        result["forecast_bags"] = np.ceil(_kg.div(_rate))
+    else:
+        result["kg_per_bag"] = np.nan
+        result["forecast_bags"] = np.nan
+    return result
+
+
 @st.cache_data(ttl=900, max_entries=4, show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...",
                 hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_channel="Specialty Retail"):
@@ -1454,7 +1509,7 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
-def project_forward_with_range(actual_series, error_sigma, n_periods=8):
+def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_trend=False):
     """Projects multiple periods ahead using a single non-seasonal ARIMA(1,1,1) fit, which
     produces the whole path at once with real statistical confidence intervals (verified:
     recursive re-feeding through ARIMA produced a forecast that more than doubled over 8
@@ -1478,15 +1533,28 @@ def project_forward_with_range(actual_series, error_sigma, n_periods=8):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 from statsmodels.tsa.statespace.sarimax import SARIMAX
+                # keep_trend adds a linear time term. Without it, ARIMA(1,1,1) converges to a
+                # flat line within about 3-4 steps -- fine for a 1-week forecast, but it makes
+                # a multi-month projection go dead flat, which is what people were seeing on
+                # the monthly view. The trend term keeps a real slope; the cap below stops it
+                # extrapolating away to something implausible.
                 model = SARIMAX(vals, order=(1, 1, 1), seasonal_order=seasonal,
+                                 trend="t" if keep_trend else "n",
                                  enforce_stationarity=False, enforce_invertibility=False)
                 fit = model.fit(disp=False)
                 result = fit.get_forecast(steps=n_periods)
                 mean = result.predicted_mean
                 ci = result.conf_int(alpha=0.20)  # ~80% interval, roughly matching a P10-P90 framing
+                # a linear trend runs forever, so bound the whole path to a sane multiple of
+                # recent reality rather than letting month 12 imply a tripling
+                recent_ref = float(np.median(vals[-6:])) if len(vals) >= 6 else float(np.median(vals))
+                cap_hi = recent_ref * 2.5 if recent_ref > 0 else None
+                cap_lo = recent_ref * 0.3 if recent_ref > 0 else None
                 path = []
                 for h in range(n_periods):
                     f = max(float(mean[h]), 0)
+                    if cap_hi is not None:
+                        f = min(max(f, cap_lo), cap_hi)
                     low = max(float(ci[h, 0]), 0)
                     high = max(float(ci[h, 1]), f)
                     path.append({"step": h + 1, "forecast_kg": f, "low": low, "high": high})
@@ -1562,8 +1630,14 @@ if not all_events.empty:
         (all_events["starting_cycle"] <= cycle) &
         ((all_events["ongoing"] == 1) | (all_events["starting_cycle"] == cycle))
     ]
+    # convert the event's MONTHLY figure into a weekly contribution before it meets a weekly
+    # forecast. Real bug: the monthly number was added straight onto next week's forecast, so
+    # a 4,000 kg/month event inflated a single week by 4,000 kg -- about 4.3x too much.
+    # 4.345 = average weeks per month (365.25 / 7 / 12).
+    WEEKS_PER_MONTH = 4.345
     pipeline_by_cp = applicable.groupby(["channel", "product"], as_index=False)["expected_kg_per_month"].sum() \
         .rename(columns={"expected_kg_per_month": "pipeline_kg"})
+    pipeline_by_cp["pipeline_kg"] = pipeline_by_cp["pipeline_kg"] / WEEKS_PER_MONTH
 else:
     applicable = pd.DataFrame()
     pipeline_by_cp = pd.DataFrame(columns=["channel", "product", "pipeline_kg"])
@@ -1870,7 +1944,9 @@ with tab_dash:
         show_projection = st.checkbox("Also show the forecast projection", key="show_trend_projection")
         if show_projection:
             with st.spinner("Projecting the trend forward..."):
-                projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma, n_periods=n_periods_fwd)
+                projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma,
+                                                        n_periods=n_periods_fwd,
+                                                        keep_trend=(trend_freq == "Month"))
         else:
             projection = pd.DataFrame()
 
@@ -1984,7 +2060,9 @@ with tab_dash:
                         st.info("Not enough history yet for this segment.")
                         continue
 
-                    projection_pt = project_forward_with_range(agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown)
+                    projection_pt = project_forward_with_range(
+                        agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown,
+                        keep_trend=(freq == "M"))
 
                     # anchor period 1 to the SAME single-step forecast that feeds the Overview
                     # KPI total -- guarantees this table's first period matches the top of the
@@ -2078,39 +2156,44 @@ with tab_dash:
         # ===============================================================
         # STAPLE — CHANNEL & BAG SIZE, 3 MONTHS AHEAD (for Operations' bag ordering)
         # ===============================================================
-        if "Staple" in product_types_available and "size_label" in sales_df.columns:
-            st.markdown("## Staple — by channel & bag size, 3 months ahead")
+        if "size_label" in sales_df.columns:
+            st.markdown("## Bag ordering — every channel & size, 3 months ahead")
             st.caption(
-                "For Operations' bag ordering, which needs roughly a 3-month lead time. Specialty Retail "
-                "is forecasted directly (it's grown to ~46%+ of Staple and is still actively shifting, so "
-                "a proportional split would lag its real trajectory) — every other channel splits the "
-                "remainder by trending share, and bag size within each channel the same way. If a size "
-                "looks off here, that's the signal to order early rather than find out in 3 months."
+                "Everything Operations needs to place a bag order: all three segments (Single and both "
+                "Staple segments), every channel, every bag size, three months out for lead time. Each "
+                "segment is projected on its own history, then split by trending channel share and bag-size "
+                "share, and converted to real bag counts using the kg-per-bag rate learned from your sales."
             )
-            if st.button("Compute breakdown", key="compute_staple_breakdown"):
+            if st.button("Compute bag order breakdown", key="compute_staple_breakdown"):
                 st.session_state["show_staple_breakdown"] = True
 
             if st.session_state.get("show_staple_breakdown"):
-                breakdown_df = compute_staple_channel_breakdown(sales_df, n_periods=3, freq="M")
+                breakdown_df = compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M")
                 if breakdown_df.empty:
-                    st.info("Not enough Staple history yet for this breakdown.")
-                elif breakdown_df["forecast_bags"].isna().all():
-                    st.warning("Showing kg only — no quantity/bag-count data was captured on upload yet, "
-                               "so a real bag count can't be computed. Re-upload with a Quantity column "
-                               "mapped (tab 1) to get actual bag counts here.")
-                    pivot = breakdown_df.pivot_table(index=["channel", "size_label"], columns="period",
-                                                       values="forecast_kg", aggfunc="sum").round(0)
-                    st.dataframe(pivot, use_container_width=True)
+                    st.info("Not enough history yet for this breakdown.")
                 else:
-                    show_unit = st.radio("Show as", ["Bags (for ordering)", "Kg"], horizontal=True, key="staple_bag_unit")
+                    has_bags = breakdown_df["forecast_bags"].notna().any()
+                    if not has_bags:
+                        st.warning("Showing kg only — no quantity/bag-count column was mapped on upload, "
+                                   "so a real bag count can't be computed. Re-upload with a Quantity column "
+                                   "mapped (tab 1) to get bag counts here.")
+                    show_unit = "Kg" if not has_bags else st.radio(
+                        "Show as", ["Bags (for ordering)", "Kg"], horizontal=True, key="staple_bag_unit")
                     value_col = "forecast_bags" if show_unit.startswith("Bags") else "forecast_kg"
-                    pivot = breakdown_df.pivot_table(index=["channel", "size_label"], columns="period",
-                                                       values=value_col, aggfunc="sum").round(0)
-                    st.dataframe(pivot, use_container_width=True)
+
+                    st.markdown("**Total bags to order, by size** — the headline number for a purchase order")
+                    totals = breakdown_df.dropna(subset=[value_col]).pivot_table(
+                        index="size_label", columns="period", values=value_col, aggfunc="sum").round(0)
+                    st.dataframe(totals, use_container_width=True)
+
+                    with st.expander("By segment, channel and size"):
+                        detail = breakdown_df.dropna(subset=[value_col]).pivot_table(
+                            index=["segment", "channel", "size_label"], columns="period",
+                            values=value_col, aggfunc="sum").round(0)
+                        st.dataframe(detail, use_container_width=True)
                     with st.expander("Kg-per-bag rates used (learned from your actual data)"):
                         st.dataframe(compute_kg_per_bag(sales_df), use_container_width=True, hide_index=True)
-                    st.caption("Rows sum to each channel's reconciled total; every channel's total sums to "
-                               "the overall Staple forecast for that month.")
+                    st.caption("Bag counts are rounded up per line — you can't order a partial bag.")
             st.divider()
 
         st.markdown("### Filter / break down by")
@@ -2231,6 +2314,34 @@ with tab_dash:
                 # happened. A row's channel/product is known either because it's one of the
                 # grouped dimensions, or because it's pinned by the filter above; when both
                 # are known and an override exists for that exact pair, the override wins.
+                # add pipeline events to the rows they actually belong to, BEFORE overrides.
+                # Real bug: the event's kg was included in the total and then split by
+                # HISTORICAL share -- so a brand-new customer's volume (which has no history
+                # at all) got smeared across existing segments instead of landing on the one
+                # it was logged against. Subtracting it from the share-split base and adding
+                # it to the matching rows puts it where it belongs.
+                event_applied_rows = 0
+                if not applicable.empty and horizon == "Next week":
+                    _ev = applicable.copy()
+                    _ev["weekly_kg"] = _ev["expected_kg_per_month"] / 4.345
+                    for _, ev in _ev.iterrows():
+                        for idx, row in shares.iterrows():
+                            ok = True
+                            for dim in ("channel", "product", "customer"):
+                                if dim not in ev or pd.isna(ev.get(dim)):
+                                    continue
+                                target = str(ev[dim])
+                                actual = str(row[dim]) if dim in group_cols else \
+                                    (str(filter_values[dim]) if dim in filter_values else None)
+                                if actual is None or actual != target:
+                                    ok = False
+                                    break
+                            if ok:
+                                shares.at[idx, "forecast_kg"] = round(
+                                    float(shares.at[idx, "forecast_kg"]) + float(ev["weekly_kg"]), 1)
+                                event_applied_rows += 1
+                                break
+
                 override_applied_rows = 0
                 if not active_overrides.empty and horizon == "Next week":
                     def _resolve(row, dim):
@@ -2262,6 +2373,9 @@ with tab_dash:
                                  "Next year": "Forecast kg (next year, extrapolated)"}[horizon]
 
                 st.metric(f"Total — {horizon.lower()}", f"{canonical_total:,.0f} kg")
+                if event_applied_rows:
+                    st.caption(f"{event_applied_rows} row(s) include a logged pipeline event "
+                               "(converted from the monthly figure to a weekly one).")
                 if override_applied_rows:
                     st.caption(f"{override_applied_rows} row(s) replaced by an active manual override — "
                                "the total above reflects those overridden values.")
@@ -2484,14 +2598,8 @@ with tab_dash:
             if cap_status_text:
                 color2 = "#b3432f" if cap_shortfall else "#4a7a5c"
                 cap_html = f'<p style="color:{color2};font-weight:600">{cap_status_text}</p>'
-            if not report_dollar_df.empty:
-                display_df = report_dollar_df.copy()
-                display_df["Forecast (CAD)"] = display_df["Forecast (CAD)"].map(lambda x: f"${x:,.0f}")
-                dollar_html = display_df.to_html(index=False, border=0)
-            else:
-                dollar_html = "<p>No forecast available yet.</p>"
-            overview_html = report_overview_df.to_html(index=False, border=0)
-            accuracy_html = report_accuracy_df.to_html(index=False, border=0) if not report_accuracy_df.empty else "<p>Not enough history yet.</p>"
+            # report is intentionally KPI + charts only -- the detail tables were dropped so
+            # it reads as a one-glance summary for a meeting rather than a data dump
 
             trend_fig = go.Figure(go.Scatter(x=report_trend_df["period"], y=report_trend_df["kg"], mode="lines",
                                               fill="tozeroy", line=dict(color="rgb(139,90,60)", width=2)))
@@ -2523,17 +2631,9 @@ th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
 {cap_html}
 <h2>Overall trend — actual sales</h2>
 {trend_chart_html}
-<h2>Translated forecast — kg and CAD</h2>
-{dollar_html}
 <h2>Forecast by segment</h2>
 {bar_chart_html if bar_chart_html else "<p>No forecast available yet.</p>"}
-<h2>Forecast accuracy overview</h2>
-{overview_html}
-<h2>Forecast accuracy — MAPE and bias</h2>
-{accuracy_html}
-<p class="meta">ALERT = actuals off by 15%+ from forecast over the last 4 weeks. WATCH = 8-15%.
-MAPE = average error size regardless of direction. Bias: positive = under-forecasting, negative = over-forecasting.
-Generated automatically from 49th Parallel's demand planning app.</p>
+<p class="meta">Generated automatically from 49th Parallel's demand planning app.</p>
 </body></html>"""
 
         def build_report_pdf():
@@ -2722,6 +2822,48 @@ with tab_data:
         "Export this from Lightspeed/Acumatica and upload as CSV. Uploading new data automatically "
         "updates the forecast and checks last week's prediction."
     )
+    # what's already in the database -- so you can see at a glance what period is covered
+    # and spot a missing or short month before it quietly skews a forecast
+    if has_data:
+        _p = sales_df.copy()
+        _p["record_date"] = pd.to_datetime(_p["record_date"], errors="coerce")
+        _p = _p.dropna(subset=["record_date"])
+        if not _p.empty:
+            _lo, _hi = _p["record_date"].min(), _p["record_date"].max()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Rows in database", f"{len(_p):,}")
+            m2.metric("Earliest record", _lo.strftime("%b %d, %Y"))
+            m3.metric("Latest record", _hi.strftime("%b %d, %Y"))
+            # surface duplicate batches -- if the same file went in twice, every downstream
+            # number is inflated and it is very hard to spot from the dashboard alone
+            _dupe_check = _p.groupby("upload_batch", as_index=False).agg(
+                rows=("kg", "size"), total_kg=("kg", "sum"),
+                first_date=("record_date", "min"), last_date=("record_date", "max"))
+            _dupe_check["signature"] = (_dupe_check["rows"].astype(str) + " rows | "
+                                        + _dupe_check["first_date"].dt.strftime("%Y-%m-%d") + " to "
+                                        + _dupe_check["last_date"].dt.strftime("%Y-%m-%d"))
+            _sig_counts = _dupe_check["signature"].value_counts()
+            _suspect = _dupe_check[_dupe_check["signature"].isin(_sig_counts[_sig_counts > 1].index)]
+            if not _suspect.empty:
+                st.error(f"Possible duplicate uploads: {len(_suspect)} batches cover the exact same "
+                         "date range with the same row count. If the same file was uploaded twice, "
+                         "every forecast built on it is overstated — delete the extra batch below.")
+                st.dataframe(_suspect[["upload_batch", "rows", "total_kg", "signature"]]
+                             .rename(columns={"upload_batch": "Batch", "rows": "Rows",
+                                              "total_kg": "Total kg", "signature": "Covers"}),
+                             use_container_width=True, hide_index=True)
+
+            with st.expander("Records by month — check for gaps or short months"):
+                _by_month = _p.assign(Month=_p["record_date"].dt.to_period("M").astype(str)) \
+                    .groupby("Month", as_index=False).agg(Rows=("kg", "size"), Total_kg=("kg", "sum"))
+                _by_month["Total_kg"] = _by_month["Total_kg"].round(0)
+                _by_month = _by_month.sort_values("Month", ascending=False)
+                st.dataframe(_by_month.rename(columns={"Total_kg": "Total kg"}),
+                             use_container_width=True, hide_index=True)
+                st.caption("A month with unusually few rows or low kg is often a partial upload — "
+                           "worth checking before trusting a forecast built on it.")
+        st.divider()
+
     uploaded = st.file_uploader("CSV or Excel file", type=["csv", "xlsx", "xls"])
 
     if uploaded is not None:
@@ -2828,6 +2970,28 @@ with tab_data:
         batch_name = st.text_input("Name this upload batch", value=f"upload_{datetime.now().strftime('%Y%m%d_%H%M')}")
 
         if st.button("Process and save", type="primary"):
+            # Guard against double-inserting the same batch. Real bug: nothing stopped the
+            # same file being written twice -- a double-click, or a rerun landing before the
+            # first insert finished, would duplicate every row. Two layers: a session flag
+            # (catches a fast second click within the same session) and a database check
+            # (catches a repeat after a reboot, where session state is gone).
+            _inflight = st.session_state.get("_upload_inflight")
+            _existing = pd.read_sql(
+                "SELECT COUNT(*) AS n FROM sales_records WHERE upload_batch = ?",
+                conn, params=(batch_name,))
+            _already = int(_existing["n"].iloc[0]) if not _existing.empty else 0
+
+            if _inflight == batch_name:
+                st.warning("That upload is already being processed — give it a moment rather than "
+                           "clicking again.")
+                st.stop()
+            if _already > 0:
+                st.error(f"A batch named '{batch_name}' already exists with {_already:,} rows. "
+                         "Rename this batch if it's genuinely new data, or delete the existing "
+                         "one first — importing it again would duplicate every row.")
+                st.stop()
+
+            st.session_state["_upload_inflight"] = batch_name
             std = pd.DataFrame()
             std["record_date"] = raw[date_col].astype(str)
             std["channel"] = raw[channel_col].astype(str)
@@ -2878,6 +3042,7 @@ with tab_data:
             save_upload_column_defaults(mapping_to_remember)
 
             reset_all_derived_state()
+            st.session_state.pop("_upload_inflight", None)  # clear the guard once safely written
             st.success(f"Saved {len(std)} records from batch '{batch_name}'. Forecast will update below.")
             st.rerun()
 
@@ -2940,8 +3105,7 @@ with tab_rates:
     if not has_data:
         st.warning("No sales data uploaded yet — go to tab 1 first.")
     else:
-        st.markdown("**Price per kg** — computed from your actual revenue and kg sold, channel x item x size, "
-                     "last 120 days")
+        st.markdown("**Price per kg** — computed from your actual revenue and kg sold, last 45 days")
         display_price = price_df.copy()
         display_price["$ per kg"] = display_price["price_per_kg"].round(2)
         display_price["kg per $1 CAD"] = (1 / display_price["price_per_kg"].replace(0, np.nan)).round(4)
@@ -2949,9 +3113,31 @@ with tab_rates:
             display_price["customer_spread"] = display_price.apply(
                 lambda r: f"${r['price_min']:.2f}–${r['price_max']:.2f}" if pd.notna(r.get("price_min")) else "n/a",
                 axis=1)
-            st.dataframe(display_price[["channel", "product", "size_label", "$ per kg", "kg per $1 CAD", "customer_spread"]]
+
+            # search/filter instead of dumping every row -- this table gets long fast, and
+            # people come here looking for one specific rate, not the whole list
+            rc1, rc2, rc3 = st.columns(3)
+            with rc1:
+                _f_ch = st.selectbox("Channel", ["(all)"] + sorted(display_price["channel"].dropna().unique().tolist()),
+                                      key="rate_ch")
+            with rc2:
+                _f_sz = st.selectbox("Bag size", ["(all)"] + sorted(display_price["size_label"].dropna().astype(str).unique().tolist()),
+                                      key="rate_sz")
+            with rc3:
+                _f_q = st.text_input("Search item", key="rate_q", placeholder="e.g. OSEE12")
+
+            _view = display_price
+            if _f_ch != "(all)":
+                _view = _view[_view["channel"] == _f_ch]
+            if _f_sz != "(all)":
+                _view = _view[_view["size_label"].astype(str) == _f_sz]
+            if _f_q.strip():
+                _view = _view[_view["product"].astype(str).str.contains(_f_q.strip(), case=False, na=False)]
+
+            st.caption(f"Showing {len(_view):,} of {len(display_price):,} rate rows.")
+            st.dataframe(_view[["channel", "product", "size_label", "$ per kg", "kg per $1 CAD", "customer_spread"]]
                          .rename(columns={"customer_spread": "actual range by customer"}),
-                         use_container_width=True)
+                         use_container_width=True, hide_index=True)
             st.caption("**$ per kg** — how much revenue one kilo brings in (the more familiar framing for pricing). "
                        "**kg per $1 CAD** — the flip side: how many kilos $1 buys, useful when thinking in terms "
                        "of a budget (e.g. a $10,000 budget at 0.03 kg per $1 ≈ 300 kg). Both describe the exact "
@@ -3237,7 +3423,62 @@ with tab_salesplan:
     plan_year = st.text_input("Plan year", value=str(date.today().year), key="plan_year")
 
     st.markdown("### Upload a plan (bulk)")
+    plan_layout = st.radio(
+        "How is your plan laid out?",
+        ["Wide — months across the top (our standard template)", "Long — one row per channel/month"],
+        help="The company revenue template has channels down the side and one column per month. "
+             "Pick 'Wide' for that; the app will unpivot it for you.")
     plan_file = st.file_uploader("CSV or Excel", type=["csv", "xlsx", "xls"], key="plan_upload")
+
+    if plan_file is not None and plan_layout.startswith("Wide"):
+        _raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
+        st.dataframe(_raw.head(8), use_container_width=True)
+        _label_col = st.selectbox("Which column holds the channel names?", list(_raw.columns), key="wide_label")
+        # month columns are the ones that parse as real dates -- the template uses actual
+        # datetime headers, so this identifies them without asking the user to list them
+        _month_cols = [col for col in _raw.columns
+                       if isinstance(col, (datetime, pd.Timestamp))]
+        if not _month_cols:
+            st.warning("No date-style column headers found. If your months are text (e.g. 'Jan 2026'), "
+                       "use the 'Long' layout instead, or reformat the headers as dates.")
+        else:
+            st.caption(f"Found {len(_month_cols)} month columns: "
+                       f"{pd.Timestamp(_month_cols[0]).strftime('%b %Y')} to "
+                       f"{pd.Timestamp(_month_cols[-1]).strftime('%b %Y')}")
+            _unit = st.radio("These values are:", ["Revenue ($)", "Volume (kg)"], horizontal=True, key="wide_unit")
+            _year = st.number_input("Plan year", min_value=2000, max_value=2100,
+                                     value=int(pd.Timestamp(_month_cols[0]).year), key="wide_year")
+            if st.button("Import this plan", type="primary"):
+                _long = _raw.melt(id_vars=[_label_col], value_vars=_month_cols,
+                                   var_name="month_dt", value_name="value")
+                _long = _long.dropna(subset=["value"])
+                _long = _long[pd.to_numeric(_long["value"], errors="coerce").notna()]
+                if _long.empty:
+                    st.warning("No numeric values found in those month columns — the sheet may still be "
+                               "an empty template.")
+                else:
+                    _long["month"] = pd.to_datetime(_long["month_dt"]).dt.month
+                    _long["channel"] = _long[_label_col].astype(str).str.strip()
+                    _long["product"] = "(all)"
+                    _long["value"] = pd.to_numeric(_long["value"], errors="coerce")
+                    rows_written = 0
+                    for _, r in _long.iterrows():
+                        _kg = _rev = None
+                        if _unit.startswith("Revenue"):
+                            _rev = float(r["value"])
+                        else:
+                            _kg = float(r["value"])
+                        conn.execute("""INSERT INTO sales_plan
+                            (plan_year, month, channel, product, planned_kg, planned_revenue, submitted_by, timestamp)
+                            VALUES (?,?,?,?,?,?,?,?)""",
+                            (int(_year), int(r["month"]), r["channel"], r["product"],
+                             _kg, _rev, "wide import", datetime.now().isoformat()))
+                        rows_written += 1
+                    conn.commit()
+                    st.success(f"Imported {rows_written} plan rows from the wide template.")
+                    st.rerun()
+        plan_file = None  # handled above; skip the long-format path below
+
     if plan_file is not None:
         plan_raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
         st.dataframe(plan_raw.head(), use_container_width=True)
@@ -3389,8 +3630,12 @@ with tab_pipeline:
             product = st.selectbox("Product", sorted(sales_df["product"].unique().tolist())
                                     if has_data else ["Product"])
         with c2:
-            expected_kg = st.number_input(
-                "Expected kg impact per month", step=1.0,
+            rate_unit = st.radio(
+                "How is this volume expressed?", ["Per month", "Per week"], horizontal=True,
+                help="A new account quoted as 'X kg a month' vs 'X kg a week' are very different "
+                     "amounts — pick whichever way you were told it, and the app converts.")
+            expected_kg_raw = st.number_input(
+                "Expected kg impact", step=1.0,
                 help="Positive for new/growing business, negative for a lost account.")
             starting_cycle = st.text_input("Starting cycle", value=cycle,
                                             help="Which cycle this first applies to, e.g. 2026-08")
@@ -3400,6 +3645,9 @@ with tab_pipeline:
         note = st.text_area("Note (context for whoever reads this later)")
 
         if st.form_submit_button("Log this event", type="primary"):
+            # store everything as a monthly figure regardless of how it was entered, so there
+            # is exactly one unit in the database and no ambiguity downstream
+            expected_kg = expected_kg_raw * 4.345 if rate_unit == "Per week" else expected_kg_raw
             conn.execute("""INSERT INTO pipeline_events
                 (timestamp, submitted_by, event_type, customer, channel, product,
                  expected_kg_per_month, starting_cycle, ongoing, note)

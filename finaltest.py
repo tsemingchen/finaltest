@@ -961,6 +961,30 @@ def compute_segment_forecast(sales_df, freq="W"):
     return results
 
 
+@st.cache_data(ttl=900, max_entries=8, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def compute_rates_by(df, group_cols, recent_days=45):
+    """Weighted price per kg at ANY grouping — by bag size alone, by channel alone, by
+    customer, or any combination. The fixed channel x item x size table couldn't answer
+    "what does a 12oz bag average across the whole business?", because it always split by
+    all three at once. Same weighted method as everywhere else: total revenue / total kg,
+    so a large order counts proportionally more than a small one."""
+    group_cols = [g for g in group_cols if g in df.columns]
+    if not group_cols or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["record_date"] = pd.to_datetime(d["record_date"], errors="coerce")
+    if d["record_date"].notna().any():
+        cutoff = d["record_date"].max() - pd.Timedelta(days=recent_days)
+        recent = d[d["record_date"] >= cutoff]
+        d = recent if len(recent) >= 20 else d
+    g = d.groupby(group_cols, as_index=False, observed=True).agg(
+        total_kg=("kg", "sum"), total_revenue=("revenue", "sum"), lines=("kg", "size"))
+    g["$ per kg"] = (g["total_revenue"] / g["total_kg"].replace(0, np.nan)).round(2)
+    g["kg per $1 CAD"] = (1 / g["$ per kg"].replace(0, np.nan)).round(4)
+    g["total_kg"] = g["total_kg"].round(0)
+    return g.sort_values("total_kg", ascending=False)
+
+
 @st.cache_data(ttl=900, max_entries=8, show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
@@ -3116,36 +3140,42 @@ with tab_rates:
 
             # search/filter instead of dumping every row -- this table gets long fast, and
             # people come here looking for one specific rate, not the whole list
-            rc1, rc2, rc3 = st.columns(3)
-            with rc1:
-                _f_ch = st.selectbox("Channel", ["(all)"] + sorted(display_price["channel"].dropna().unique().tolist()),
-                                      key="rate_ch")
-            with rc2:
-                _f_sz = st.selectbox("Bag size", ["(all)"] + sorted(display_price["size_label"].dropna().astype(str).unique().tolist()),
-                                      key="rate_sz")
-            with rc3:
-                _f_q = st.text_input("Search item", key="rate_q", placeholder="e.g. OSEE12")
+            st.markdown("**Group the rates by whichever dimensions you care about**")
+            _dims = {"Channel": "channel", "Item": "product", "Bag size": "size_label"}
+            if "customer" in sales_df.columns and not (sales_df["customer"] == "(not tracked)").all():
+                _dims["Customer"] = "customer"
+            _picked = st.multiselect(
+                "Break down by", list(_dims.keys()), default=["Bag size"],
+                help="Pick one to see rates for just that dimension (e.g. Bag size alone gives the "
+                     "average $/kg for each size across the whole business). Pick several to split "
+                     "them further.")
 
-            _view = display_price
-            if _f_ch != "(all)":
-                _view = _view[_view["channel"] == _f_ch]
-            if _f_sz != "(all)":
-                _view = _view[_view["size_label"].astype(str) == _f_sz]
-            if _f_q.strip():
-                _view = _view[_view["product"].astype(str).str.contains(_f_q.strip(), case=False, na=False)]
-
-            st.caption(f"Showing {len(_view):,} of {len(display_price):,} rate rows.")
-            st.dataframe(_view[["channel", "product", "size_label", "$ per kg", "kg per $1 CAD", "customer_spread"]]
-                         .rename(columns={"customer_spread": "actual range by customer"}),
-                         use_container_width=True, hide_index=True)
-            st.caption("**$ per kg** — how much revenue one kilo brings in (the more familiar framing for pricing). "
-                       "**kg per $1 CAD** — the flip side: how many kilos $1 buys, useful when thinking in terms "
-                       "of a budget (e.g. a $10,000 budget at 0.03 kg per $1 ≈ 300 kg). Both describe the exact "
-                       "same rate, just read in whichever direction is more useful for what you're doing. "
-                       "'Actual range by customer' shows how much the average is blending together — a wide "
-                       "range means some customers pay meaningfully more or less than the average shown.")
-        else:
-            st.dataframe(price_df, use_container_width=True)
+            if not _picked:
+                st.info("Pick at least one dimension above to see rates.")
+            else:
+                _gcols = [_dims[p] for p in _picked]
+                _rates = compute_rates_by(sales_df, _gcols)
+                if _rates.empty:
+                    st.info("Not enough data for that combination.")
+                else:
+                    _q = st.text_input("Search within these results", key="rate_q",
+                                        placeholder="e.g. OSEE12, Costco, 12oz")
+                    _view = _rates
+                    if _q.strip():
+                        _mask = pd.Series(False, index=_view.index)
+                        for gc in _gcols:
+                            _mask |= _view[gc].astype(str).str.contains(_q.strip(), case=False, na=False)
+                        _view = _view[_mask]
+                    st.caption(f"Showing {len(_view):,} of {len(_rates):,} rows — "
+                               f"grouped by {', '.join(_picked).lower()}, last 45 days.")
+                    st.dataframe(
+                        _view[_gcols + ["$ per kg", "kg per $1 CAD", "total_kg", "lines"]]
+                        .rename(columns={"total_kg": "Kg sold (basis)", "lines": "Sale lines"}),
+                        use_container_width=True, hide_index=True)
+                    st.caption("**$ per kg** — revenue one kilo brings in. **kg per $1 CAD** — the flip "
+                               "side, useful for budgeting. 'Kg sold (basis)' shows how much real volume "
+                               "each rate is computed from — a rate built on very little volume is less "
+                               "reliable than one built on a lot.")
         st.download_button("Download price_per_kg.csv", price_df.to_csv(index=False), "price_per_kg.csv")
 
         st.markdown("**Price per kg by customer** — real customer-specific pricing, where there's enough "
@@ -3405,10 +3435,39 @@ with tab_forecast:
     if not all_overrides_history.empty:
         with st.expander("Override history (active and turned-off)"):
             history_display = all_overrides_history.copy()
+            if "customer" not in history_display.columns:
+                history_display["customer"] = OVERRIDE_ANY
+            history_display["customer"] = history_display["customer"].fillna(OVERRIDE_ANY)
             history_display["status"] = history_display["active"].map({1: "Active", 0: "Turned off"})
-            st.dataframe(history_display[["channel", "product", "override_kg", "period_type",
+            st.dataframe(history_display[["channel", "product", "customer", "override_kg", "period_type",
                                            "submitted_by", "note", "timestamp", "status"]],
                          use_container_width=True)
+
+            # turning one back on -- previously the only way to reinstate a turned-off
+            # override was to retype it in the form above, which loses the original note,
+            # who set it, and when
+            _off = history_display[history_display["active"] == 0]
+            if not _off.empty:
+                st.markdown("**Turn one back on**")
+                _off_labels = (_off["channel"].astype(str) + " — " + _off["product"].astype(str)
+                               + " — " + _off["customer"].astype(str)
+                               + "  ·  " + _off["override_kg"].round(0).astype(int).astype(str) + " kg"
+                               + "  ·  set by " + _off["submitted_by"].fillna("?").astype(str)).tolist()
+                _off_ids = _off["id"].tolist()
+                _pick = st.selectbox("Turned-off overrides", _off_labels, key="reactivate_pick")
+                if st.button("Turn this override back on"):
+                    _rid = _off_ids[_off_labels.index(_pick)]
+                    _row = all_overrides_history[all_overrides_history["id"] == _rid].iloc[0]
+                    _cust = _row.get("customer") or OVERRIDE_ANY
+                    # deactivate anything with the same scope first, so reinstating this one
+                    # doesn't leave two competing rules at identical specificity
+                    conn.execute("""UPDATE manual_overrides SET active = 0
+                        WHERE channel = ? AND product = ? AND COALESCE(customer, ?) = ? AND active = 1""",
+                        (_row["channel"], _row["product"], OVERRIDE_ANY, _cust))
+                    conn.execute("UPDATE manual_overrides SET active = 1 WHERE id = ?", (int(_rid),))
+                    conn.commit()
+                    st.success("Override reinstated — it applies again everywhere in the app.")
+                    st.rerun()
 
 # --- TAB: Sales plan (S&OP) ---
 with tab_salesplan:

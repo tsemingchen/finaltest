@@ -211,7 +211,7 @@ def get_conn():
 conn = get_conn()
 
 
-@st.cache_data(ttl=60, max_entries=2, show_spinner=False)
+@st.cache_data(ttl=7200, max_entries=1, show_spinner=False)
 def load_sales_records():
     """Cached with a 60-second TTL -- real issue found: this was re-downloading the ENTIRE
     sales history over the network on every single interaction (Streamlit reruns the whole
@@ -225,7 +225,11 @@ def load_sales_records():
     error (which names "leaving large datasets in memory" as a primary cause) is a RAM
     limit, not a speed limit. Typically cuts this DataFrame's memory footprint substantially
     with no change to any resulting number."""
-    df = pd.read_sql("SELECT * FROM sales_records", conn)
+    # select ONLY the columns actually used -- every byte here is billed Supabase egress,
+    # and 'SELECT *' was pulling id and uploaded_at on every single load for no reason.
+    df = pd.read_sql(
+        "SELECT record_date, channel, customer, product, size_label, kg, revenue, "
+        "product_type, quantity, upload_batch FROM sales_records", conn)
     for col in ["kg", "revenue", "quantity"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
@@ -1414,11 +1418,19 @@ else:
     price_df = size_mix_df = customer_mix_df = weekly_actual = backtest_df = pd.DataFrame()
 
 # --- current live forecast: latest frozen target week per channel/product ---
-live_forecast = pd.read_sql("""
-    SELECT af.* FROM auto_forecasts af
-    INNER JOIN (SELECT channel, product, MAX(target_week) AS mx FROM auto_forecasts GROUP BY channel, product) t
-    ON af.channel=t.channel AND af.product=t.product AND af.target_week=t.mx
-""", conn)
+@st.cache_data(ttl=7200, max_entries=1, show_spinner=False)
+def _load_live_forecast():
+    """Cached: this returns one row per channel/product (hundreds of rows) and was being
+    re-downloaded on every single page interaction. Every byte is billed Supabase egress."""
+    return pd.read_sql("""
+        SELECT af.id, af.channel, af.product, af.target_week, af.forecast_kg
+        FROM auto_forecasts af
+        INNER JOIN (SELECT channel, product, MAX(target_week) AS mx FROM auto_forecasts GROUP BY channel, product) t
+        ON af.channel=t.channel AND af.product=t.product AND af.target_week=t.mx
+    """, conn)
+
+
+live_forecast = _load_live_forecast()
 if not live_forecast.empty:
     # auto_forecasts is append-only -- if a (channel, product, target_week) combo was ever
     # forecasted more than once (a real bug found and fixed elsewhere: two rows summed to an
@@ -2025,8 +2037,9 @@ with tab_dash:
         horizon = st.radio("Horizon", ["Next week", "Next month", "Next year"], horizontal=True, key="fwd_horizon")
 
         if horizon == "Next week":
-            # exactly the same authoritative number as the Overview KPI above -- includes pipeline
-            # events and manual overrides, not just the raw statistical forecast
+            # same authoritative number as the Overview KPI above (segment forecasts +
+            # pipeline events). Manual overrides are applied further down, per row, since
+            # an override targets a specific channel/item rather than the company total.
             canonical_total = next_week_kg_all
         else:
             agg_canonical = aggregate_periods(sales_df, ["channel", "product"], "M")
@@ -2062,12 +2075,47 @@ with tab_dash:
                 st.info("Not enough history yet for this breakdown.")
             else:
                 shares["forecast_kg"] = (shares["share"] * canonical_total).round(1)
+
+                # Apply manual overrides to the breakdown rows. Real bug this fixes: every
+                # row here was purely "historical share x total", so an override set on a
+                # specific channel/item never appeared -- you could set OSEE12 to 2000 kg and
+                # the table would keep showing its share-derived number as if nothing
+                # happened. A row's channel/product is known either because it's one of the
+                # grouped dimensions, or because it's pinned by the filter above; when both
+                # are known and an override exists for that exact pair, the override wins.
+                override_applied_rows = 0
+                if not active_overrides.empty and horizon == "Next week":
+                    _ov = {(str(r["channel"]), str(r["product"])): float(r["override_kg"])
+                           for _, r in active_overrides.iterrows()}
+
+                    def _resolve(row, dim):
+                        if dim in group_cols:
+                            return str(row[dim])
+                        v = filter_values.get(dim)
+                        return str(v) if v is not None else None
+
+                    new_vals = []
+                    for _, row in shares.iterrows():
+                        ch, pr = _resolve(row, "channel"), _resolve(row, "product")
+                        if ch is not None and pr is not None and (ch, pr) in _ov:
+                            new_vals.append(round(_ov[(ch, pr)], 1))
+                            override_applied_rows += 1
+                        else:
+                            new_vals.append(row["forecast_kg"])
+                    shares["forecast_kg"] = new_vals
+                    if override_applied_rows:
+                        # the total must reflect the overridden rows, not the pre-override split
+                        canonical_total = float(shares["forecast_kg"].sum())
+
                 shares["Segment"] = shares[group_cols].astype(str).agg(" — ".join, axis=1) \
                     if len(group_cols) > 1 else shares[group_cols[0]]
                 period_label = {"Next week": "Forecast kg (next week)", "Next month": "Forecast kg (next month)",
                                  "Next year": "Forecast kg (next year, extrapolated)"}[horizon]
 
                 st.metric(f"Total — {horizon.lower()}", f"{canonical_total:,.0f} kg")
+                if override_applied_rows:
+                    st.caption(f"{override_applied_rows} row(s) replaced by an active manual override — "
+                               "the total above reflects those overridden values.")
                 display_shares = shares.sort_values("forecast_kg", ascending=False)
                 st.dataframe(
                     display_shares[["Segment", "forecast_kg"]].rename(columns={"forecast_kg": period_label}),
@@ -3408,14 +3456,13 @@ with tab_history:
     if st.button("Prepare sales records download"):
         st.download_button("Download sales_records.csv", sales_df.to_csv(index=False), "sales_records.csv")
     st.markdown("**Auto-generated forecasts (frozen predictions, for accuracy tracking)**")
-    # LIMIT + opt-in download, not the whole table. Real issue: this table is append-only
-    # and grows by roughly one row per channel/product combo per week (~633/week here), so
-    # after a few months it's tens of thousands of rows. Streamlit renders EVERY tab's
-    # content on every rerun -- even tabs nobody has clicked -- so an unbounded SELECT *
-    # here was being loaded and rendered on every single page load, for everyone.
-    af = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC LIMIT 500", conn)
-    st.caption("Showing the 500 most recent. Use the download below for the full history.")
-    st.dataframe(af, use_container_width=True)
+    # opt-in: Streamlit renders EVERY tab on every rerun, so this was downloading 500 rows
+    # from the database on every single page load even if nobody opened this tab. That is
+    # billed egress, and it added up fast.
+    if st.button("Show recent forecasts"):
+        af = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC LIMIT 500", conn)
+        st.caption("Showing the 500 most recent.")
+        st.dataframe(af, use_container_width=True)
     if st.button("Prepare full forecast history download"):
         af_full = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC", conn)
         st.download_button("Download auto_forecasts.csv", af_full.to_csv(index=False), "auto_forecasts.csv")

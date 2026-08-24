@@ -159,7 +159,7 @@ def get_conn():
     conn.execute(f"""CREATE TABLE IF NOT EXISTS manual_overrides (
         {id_col},
         timestamp TEXT, submitted_by TEXT,
-        channel TEXT, product TEXT, override_kg REAL, note TEXT, active INTEGER,
+        channel TEXT, product TEXT, customer TEXT, override_kg REAL, note TEXT, active INTEGER,
         period_type TEXT, target_week TEXT
     )""")
     conn.execute(f"""CREATE TABLE IF NOT EXISTS ops_capacity (
@@ -200,6 +200,12 @@ def get_conn():
         conn.commit()  # SQLite fallback doesn't support IF NOT EXISTS on ADD COLUMN pre-3.35; ignore if it fails
     try:
         conn.execute("ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS quantity REAL")
+        conn.commit()
+    except Exception:
+        conn.commit()
+    # migration: manual_overrides predates customer-level and wildcard overrides
+    try:
+        conn.execute("ALTER TABLE manual_overrides ADD COLUMN IF NOT EXISTS customer TEXT")
         conn.commit()
     except Exception:
         conn.commit()
@@ -447,8 +453,17 @@ def check_stale_ongoing_overrides(weekly_actual, active_overrides, n_weeks=4, to
     for _, row in active_overrides.iterrows():
         if row.get("period_type") != "Ongoing":
             continue
-        hist = weekly_actual[(weekly_actual["channel"] == row["channel"]) &
-                             (weekly_actual["product"] == row["product"])].sort_values("week_start")
+        # honour wildcards: a channel-wide override should be judged against that whole
+        # channel's actuals, not silently skipped because no exact channel+item pair matches
+        hist = weekly_actual.copy()
+        if str(row.get("channel", OVERRIDE_ANY)) != OVERRIDE_ANY:
+            hist = hist[hist["channel"] == row["channel"]]
+        if str(row.get("product", OVERRIDE_ANY)) != OVERRIDE_ANY:
+            hist = hist[hist["product"] == row["product"]]
+        if hist.empty:
+            continue
+        # sum to one figure per week before comparing -- a broad override covers many rows
+        hist = hist.groupby("week_start", as_index=False)["actual_kg"].sum().sort_values("week_start")
         recent = hist.tail(n_weeks)
         if len(recent) < n_weeks:
             continue  # not enough real weeks yet to judge it fairly
@@ -465,6 +480,106 @@ def check_stale_ongoing_overrides(weekly_actual, active_overrides, n_weeks=4, to
                     "weeks_checked": n_weeks,
                 })
     return flagged
+
+
+OVERRIDE_ANY = "(all)"
+
+
+def override_specificity(row):
+    """How specific an override is: the number of dimensions it actually pins down.
+    A channel+item+customer override (3) beats channel+item (2), which beats channel
+    alone (1). Used so the most specific rule wins when several could apply."""
+    return sum(1 for dim in ("channel", "product", "customer")
+               if str(row.get(dim, OVERRIDE_ANY)) != OVERRIDE_ANY)
+
+
+def find_matching_override(overrides_df, channel=None, product=None, customer=None):
+    """Returns the override_kg for the MOST SPECIFIC active override matching this
+    channel/product/customer, or None if nothing matches.
+
+    An override dimension set to "(all)" is a wildcard and matches anything; a dimension
+    set to a real value only matches that value. A dimension we don't know for the row
+    being priced (e.g. no customer breakdown in view) can only match a wildcard -- we
+    never guess that an unknown value happens to equal a specific override's target.
+
+    Most-specific-wins was the deliberate choice: an item-level override is a more
+    considered statement than a blanket channel one, so it shouldn't be silently
+    overwritten by the broader rule."""
+    if overrides_df is None or overrides_df.empty:
+        return None
+    known = {"channel": channel, "product": product, "customer": customer}
+    best_val, best_score = None, -1
+    for _, row in overrides_df.iterrows():
+        matched = True
+        for dim, actual in known.items():
+            target = str(row.get(dim, OVERRIDE_ANY) or OVERRIDE_ANY)
+            if target == OVERRIDE_ANY:
+                continue  # wildcard matches anything, including unknown
+            if actual is None or str(actual) != target:
+                matched = False
+                break
+        if matched:
+            score = override_specificity(row)
+            if score > best_score:
+                best_val, best_score = float(row["override_kg"]), score
+    return best_val
+
+
+def apply_overrides_to_segments(sales_df, segment_forecasts, active_overrides, freq="W"):
+    """Folds manual overrides into the per-segment forecasts, so the Overview KPI, the
+    segment tables, and the charts all reflect them -- previously overrides only reached the
+    per-item forecast table and the detailed breakdown, so the headline number and charts
+    quietly ignored them.
+
+    Works on DELTAS rather than replacement. An override states what one slice should be, but
+    a segment covers many slices, so we can't just swap the segment's number. Instead: work
+    out what that slice was contributing to the segment (its historical share x the segment
+    forecast), then shift the segment by the difference between the override and that
+    baseline. A 2,000 kg override on a slice currently contributing 1,000 kg raises its
+    segment by 1,000 kg -- everything else in the segment is left alone.
+
+    Returns (adjusted_forecasts, notes) where notes describes each adjustment made."""
+    if not segment_forecasts or active_overrides is None or active_overrides.empty:
+        return dict(segment_forecasts or {}), []
+
+    adjusted = dict(segment_forecasts)
+    notes = []
+    segments = split_into_segments(sales_df)
+
+    for _, ov in active_overrides.iterrows():
+        ov_ch = str(ov.get("channel", OVERRIDE_ANY) or OVERRIDE_ANY)
+        ov_pr = str(ov.get("product", OVERRIDE_ANY) or OVERRIDE_ANY)
+        ov_cu = str(ov.get("customer", OVERRIDE_ANY) or OVERRIDE_ANY)
+        ov_kg = float(ov["override_kg"])
+
+        for label, seg_df in segments.items():
+            if label not in adjusted or seg_df.empty:
+                continue
+            scope = seg_df
+            if ov_ch != OVERRIDE_ANY:
+                scope = scope[scope["channel"] == ov_ch]
+            if ov_pr != OVERRIDE_ANY:
+                scope = scope[scope["product"] == ov_pr]
+            if ov_cu != OVERRIDE_ANY and "customer" in scope.columns:
+                scope = scope[scope["customer"] == ov_cu]
+            if scope.empty:
+                continue  # this override doesn't touch this segment
+
+            seg_total_kg = seg_df["kg"].sum()
+            if seg_total_kg <= 0:
+                continue
+            share = scope["kg"].sum() / seg_total_kg
+            baseline = adjusted[label] * share
+            delta = ov_kg - baseline
+            adjusted[label] = max(adjusted[label] + delta, 0.0)
+            notes.append({
+                "scope": " / ".join(p for p in [ov_ch, ov_pr, ov_cu] if p != OVERRIDE_ANY) or "(all)",
+                "segment": label,
+                "was_contributing_kg": round(baseline, 1),
+                "override_kg": round(ov_kg, 1),
+                "segment_change_kg": round(delta, 1),
+            })
+    return adjusted, notes
 
 
 def load_known_classifications():
@@ -1502,17 +1617,30 @@ if not manual_overrides_df.empty:
 
     if not active_overrides.empty:
         if not forecast_by_cp.empty:
-            forecast_by_cp = forecast_by_cp.merge(
-                active_overrides[["channel", "product", "override_kg"]], on=["channel", "product"], how="outer")
             forecast_by_cp["forecast_kg"] = forecast_by_cp["forecast_kg"].fillna(0)
             forecast_by_cp["pipeline_kg"] = forecast_by_cp["pipeline_kg"].fillna(0)
-            forecast_by_cp["forecast_kg"] = np.where(forecast_by_cp["override_kg"].notna(),
-                                                      forecast_by_cp["override_kg"], forecast_by_cp["forecast_kg"])
-            forecast_by_cp = forecast_by_cp.drop(columns=["override_kg"])
+            # resolve per row through the shared matcher rather than a plain merge -- a merge
+            # can only match exact channel+product pairs, so a wildcard override (e.g. a whole
+            # channel) would silently never apply here even though it applies elsewhere.
+            # An override with a specific customer is deliberately NOT applied at this level:
+            # these rows are channel x item totals across all customers, so replacing the whole
+            # row with one customer's number would overstate it.
+            _row_ov = [
+                find_matching_override(active_overrides, channel=str(r["channel"]),
+                                        product=str(r["product"]), customer=None)
+                for _, r in forecast_by_cp.iterrows()
+            ]
+            forecast_by_cp["forecast_kg"] = [
+                round(ov, 1) if ov is not None else base
+                for ov, base in zip(_row_ov, forecast_by_cp["forecast_kg"])
+            ]
         else:
-            forecast_by_cp = active_overrides.rename(columns={"override_kg": "forecast_kg"})
-            forecast_by_cp["pipeline_kg"] = 0
-            forecast_by_cp["target_week"] = None
+            _seed = active_overrides.copy()
+            _seed = _seed[(_seed["channel"] != OVERRIDE_ANY) & (_seed["product"] != OVERRIDE_ANY)]
+            if not _seed.empty:
+                forecast_by_cp = _seed.rename(columns={"override_kg": "forecast_kg"})
+                forecast_by_cp["pipeline_kg"] = 0
+                forecast_by_cp["target_week"] = None
 
 # size-level breakdown for ops/bag counts, driven by the auto forecast
 if not forecast_by_cp.empty and not size_mix_df.empty:
@@ -1611,6 +1739,11 @@ with tab_dash:
             else:
                 type_level_forecasts_with_pipeline[label] = val
         unattributed_pipeline = pipeline_by_type.get("(not tracked)", 0)  # events on products with no known type
+
+        # fold manual overrides into the segment numbers BEFORE totalling, so the headline
+        # KPI, the segment tables and every chart all reflect them
+        type_level_forecasts_with_pipeline, override_notes = apply_overrides_to_segments(
+            sales_df, type_level_forecasts_with_pipeline, active_overrides, freq="W")
 
         if type_level_forecasts:
             next_week_kg_all = sum(type_level_forecasts_with_pipeline.values()) + unattributed_pipeline
@@ -1816,6 +1949,21 @@ with tab_dash:
                     elif label in staple_labels:
                         weight = segment_forecasts[label] / staple_total_fc
                         segment_forecasts[label] += pipeline_by_type.get("Staple", 0) * weight
+
+            # same override folding the Overview KPI uses, so these tables and charts agree
+            # with the headline number instead of quietly ignoring overrides
+            segment_forecasts, seg_override_notes = apply_overrides_to_segments(
+                sales_df, segment_forecasts, active_overrides, freq=freq)
+            if seg_override_notes:
+                with st.expander(f"{len(seg_override_notes)} manual override(s) applied to these segments"):
+                    st.dataframe(pd.DataFrame(seg_override_notes).rename(columns={
+                        "scope": "Override scope", "segment": "Segment",
+                        "was_contributing_kg": "Was contributing (kg)",
+                        "override_kg": "Override (kg)", "segment_change_kg": "Segment change (kg)"}),
+                        use_container_width=True, hide_index=True)
+                    st.caption("An override sets what one slice should be. Since a segment covers many "
+                               "slices, the segment shifts by the difference between the override and what "
+                               "that slice was contributing — everything else in the segment is untouched.")
 
             seg_labels = list(segment_map.keys())
             if len(seg_labels) < 3:
@@ -2085,9 +2233,6 @@ with tab_dash:
                 # are known and an override exists for that exact pair, the override wins.
                 override_applied_rows = 0
                 if not active_overrides.empty and horizon == "Next week":
-                    _ov = {(str(r["channel"]), str(r["product"])): float(r["override_kg"])
-                           for _, r in active_overrides.iterrows()}
-
                     def _resolve(row, dim):
                         if dim in group_cols:
                             return str(row[dim])
@@ -2096,9 +2241,13 @@ with tab_dash:
 
                     new_vals = []
                     for _, row in shares.iterrows():
-                        ch, pr = _resolve(row, "channel"), _resolve(row, "product")
-                        if ch is not None and pr is not None and (ch, pr) in _ov:
-                            new_vals.append(round(_ov[(ch, pr)], 1))
+                        hit = find_matching_override(
+                            active_overrides,
+                            channel=_resolve(row, "channel"),
+                            product=_resolve(row, "product"),
+                            customer=_resolve(row, "customer"))
+                        if hit is not None:
+                            new_vals.append(round(hit, 1))
                             override_applied_rows += 1
                         else:
                             new_vals.append(row["forecast_kg"])
@@ -2956,12 +3105,25 @@ with tab_forecast:
 
     current_target_week = None
     with st.form("override_form"):
+        st.caption(f"Set any dimension to **{OVERRIDE_ANY}** to make it apply broadly — e.g. channel="
+                   f"Specialty Retail with item={OVERRIDE_ANY} overrides that whole channel. If several "
+                   "overrides could apply, the most specific one wins (an item-level rule beats a "
+                   "channel-wide one).")
         oc1, oc2 = st.columns(2)
         with oc1:
-            ov_channel = st.selectbox("Channel", sorted(sales_df["channel"].unique().tolist())
-                                       if has_data else ["Channel"], key="ov_channel")
-            ov_product = st.selectbox("Item", sorted(sales_df["product"].unique().tolist())
-                                       if has_data else ["Item"], key="ov_product")
+            _channels = [OVERRIDE_ANY] + (sorted(sales_df["channel"].unique().tolist()) if has_data else [])
+            _products = [OVERRIDE_ANY] + (sorted(sales_df["product"].unique().tolist()) if has_data else [])
+            _has_cust = has_data and "customer" in sales_df.columns and \
+                not (sales_df["customer"] == "(not tracked)").all()
+            _customers = [OVERRIDE_ANY] + (sorted(
+                sales_df.loc[sales_df["customer"] != "(not tracked)", "customer"].unique().tolist())
+                if _has_cust else [])
+            ov_channel = st.selectbox("Channel", _channels, key="ov_channel")
+            ov_product = st.selectbox("Item", _products, key="ov_product")
+            ov_customer = st.selectbox("Customer", _customers, key="ov_customer",
+                                        help="Leave as (all) unless this override is for one specific customer."
+                                        if _has_cust else "This data source doesn't include customer identity.",
+                                        disabled=not _has_cust)
         with oc2:
             ov_kg = st.number_input("Override forecast (kg)", min_value=0.0, step=10.0)
             ov_by = st.text_input("Your name")
@@ -2973,36 +3135,64 @@ with tab_forecast:
         ov_note = st.text_area("Why are you overriding this? (kept for the record, doesn't gate the override)")
 
         if st.form_submit_button("Set override", type="primary"):
-            if not live_forecast.empty:
-                match_row = live_forecast[(live_forecast["channel"] == ov_channel) & (live_forecast["product"] == ov_product)]
-                current_target_week = match_row.iloc[0]["target_week"] if not match_row.empty else None
-            period_type = "One-time" if ov_period.startswith("One-time") else "Ongoing"
-            conn.execute("UPDATE manual_overrides SET active = 0 WHERE channel = ? AND product = ?",
-                         (ov_channel, ov_product))
-            conn.execute("""INSERT INTO manual_overrides
-                (timestamp, submitted_by, channel, product, override_kg, note, active, period_type, target_week)
-                VALUES (?,?,?,?,?,?,1,?,?)""",
-                (datetime.now().isoformat(), ov_by, ov_channel, ov_product, ov_kg, ov_note, period_type, current_target_week))
-            conn.commit()
-            st.success(f"Override set — {ov_channel} / {ov_product} now forecasts at {ov_kg:,.0f} kg "
-                       f"({period_type.lower()}), everywhere in the app, replacing the auto+pipeline number.")
-            st.rerun()
+            if ov_channel == OVERRIDE_ANY and ov_product == OVERRIDE_ANY and ov_customer == OVERRIDE_ANY:
+                st.error("At least one of Channel, Item, or Customer must be a specific value — "
+                         "an override with everything set to (all) would replace the entire company forecast.")
+            else:
+                if not live_forecast.empty and ov_channel != OVERRIDE_ANY and ov_product != OVERRIDE_ANY:
+                    match_row = live_forecast[(live_forecast["channel"] == ov_channel) & (live_forecast["product"] == ov_product)]
+                    current_target_week = match_row.iloc[0]["target_week"] if not match_row.empty else None
+                elif not live_forecast.empty:
+                    # a broad override isn't tied to one channel/item pair -- anchor its
+                    # one-time expiry to the current forecast week overall
+                    current_target_week = live_forecast["target_week"].max()
+                period_type = "One-time" if ov_period.startswith("One-time") else "Ongoing"
+                # deactivate any existing override with the EXACT same scope, so setting one
+                # twice replaces it rather than leaving two competing rules at equal specificity
+                conn.execute("""UPDATE manual_overrides SET active = 0
+                    WHERE channel = ? AND product = ? AND COALESCE(customer, ?) = ?""",
+                    (ov_channel, ov_product, OVERRIDE_ANY, ov_customer))
+                conn.execute("""INSERT INTO manual_overrides
+                    (timestamp, submitted_by, channel, product, customer, override_kg, note, active, period_type, target_week)
+                    VALUES (?,?,?,?,?,?,?,1,?,?)""",
+                    (datetime.now().isoformat(), ov_by, ov_channel, ov_product, ov_customer, ov_kg,
+                     ov_note, period_type, current_target_week))
+                conn.commit()
+                _scope = " / ".join(p for p in [ov_channel, ov_product, ov_customer] if p != OVERRIDE_ANY)
+                st.success(f"Override set — {_scope} now forecasts at {ov_kg:,.0f} kg "
+                           f"({period_type.lower()}), replacing the auto+pipeline number.")
+                st.rerun()
 
     active_overrides_display = pd.read_sql("SELECT * FROM manual_overrides WHERE active = 1 ORDER BY id DESC", conn)
     if active_overrides_display.empty:
         st.info("No active overrides — every forecast is currently coming from the auto method + pipeline events.")
     else:
         st.markdown("**Active overrides**")
-        st.dataframe(active_overrides_display[["channel", "product", "override_kg", "period_type",
-                                                 "submitted_by", "note", "timestamp"]],
+        _disp = active_overrides_display.copy()
+        if "customer" not in _disp.columns:
+            _disp["customer"] = OVERRIDE_ANY
+        _disp["customer"] = _disp["customer"].fillna(OVERRIDE_ANY)
+        # show how broad each rule is, so it's obvious at a glance which one would win
+        _disp["scope"] = _disp.apply(
+            lambda r: "Most specific" if override_specificity(r) == 3
+            else ("Specific" if override_specificity(r) == 2 else "Broad"), axis=1)
+        st.dataframe(_disp[["channel", "product", "customer", "override_kg", "scope", "period_type",
+                            "submitted_by", "note", "timestamp"]],
                      use_container_width=True)
+        st.caption(f"A dimension showing {OVERRIDE_ANY} is a wildcard — it applies to everything in that "
+                   "dimension. When more than one override could apply to the same forecast, the most "
+                   "specific one wins.")
+
+        _labels = (_disp["channel"].astype(str) + " — " + _disp["product"].astype(str)
+                   + " — " + _disp["customer"].astype(str)).tolist()
+        _ids = _disp["id"].tolist()
         turn_off_label = st.selectbox(
-            "Turn off an override (reverts that channel/item back to the auto forecast)",
-            (active_overrides_display["channel"] + " — " + active_overrides_display["product"]).tolist())
+            "Turn off an override (reverts that scope back to the auto forecast)", _labels)
         if st.button("Turn off this override"):
-            sel_ch, sel_pr = turn_off_label.split(" — ", 1)
-            conn.execute("UPDATE manual_overrides SET active = 0 WHERE channel = ? AND product = ? AND active = 1",
-                         (sel_ch, sel_pr))
+            # turn off by row id, not by re-parsing the label -- a channel or item containing
+            # an em dash would have broken the old split-based matching
+            _sel_id = _ids[_labels.index(turn_off_label)]
+            conn.execute("UPDATE manual_overrides SET active = 0 WHERE id = ?", (int(_sel_id),))
             conn.commit()
             st.warning("Override turned off — reverting to the auto forecast.")
             st.rerun()

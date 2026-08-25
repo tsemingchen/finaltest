@@ -1020,7 +1020,7 @@ def compute_type_level_forecast(sales_df, freq="W"):
 
 @st.cache_data(ttl=900, max_entries=4, show_spinner="Working out bag counts...",
                 hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
-def compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M"):
+def compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M", segment_adjust=None):
     """Bag-size breakdown across EVERY segment -- Single as well as both Staple segments --
     so Operations sees one complete ordering picture instead of Staple only.
 
@@ -1051,6 +1051,12 @@ def compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M"):
             period_label = (last_date + pd.DateOffset(months=h + 1)).date().isoformat() if freq == "M" \
                 else (last_date + pd.Timedelta(weeks=h + 1)).date().isoformat()
             seg_total = proj["forecast_kg"].iloc[h]
+            # fold in this segment's share of pipeline events and manual overrides. Without
+            # this the bag order -- the number Operations actually buys against -- would
+            # ignore a signed contract or a deliberate override entirely, which is the one
+            # place that error costs real money.
+            if segment_adjust:
+                seg_total = max(seg_total + float(segment_adjust.get(label, 0.0)), 0.0)
             for _, chrow in ch_shares.iterrows():
                 ch_kg = seg_total * chrow["share"]
                 for _, srow in size_by_ch.get(chrow["channel"], pd.DataFrame()).iterrows():
@@ -1816,8 +1822,16 @@ with tab_dash:
         # same way everything else this session got reconciled.
         pipeline_by_type = {}
         if not pipeline_by_cp.empty and "product_type" in sales_df.columns:
-            product_type_lookup = sales_df[["product", "product_type"]].drop_duplicates()
-            pipeline_typed = pipeline_by_cp.merge(product_type_lookup, on="product", how="left")
+            # match on a normalised key: an event typed with different case or a stray trailing
+            # space would otherwise fail to find its product and get dumped into "(not tracked)".
+            # Also take ONE product_type per product -- if the same item appears under two
+            # classifications in the data, a plain merge would duplicate the event's kg.
+            _lookup = sales_df[["product", "product_type"]].copy()
+            _lookup["_k"] = _lookup["product"].astype(str).str.strip().str.casefold()
+            _lookup = _lookup.dropna(subset=["product_type"]).drop_duplicates(subset=["_k"], keep="first")
+            _pl = pipeline_by_cp.copy()
+            _pl["_k"] = _pl["product"].astype(str).str.strip().str.casefold()
+            pipeline_typed = _pl.merge(_lookup[["_k", "product_type"]], on="_k", how="left")
             pipeline_typed["product_type"] = pipeline_typed["product_type"].fillna("(not tracked)")
             pipeline_by_type = pipeline_typed.groupby("product_type")["pipeline_kg"].sum().to_dict()
         pipeline_total_next_week = pipeline_by_cp["pipeline_kg"].sum() if not pipeline_by_cp.empty else 0
@@ -1936,6 +1950,30 @@ with tab_dash:
                       delta=f"{cap_gap:,.0f} kg/mo", delta_color="normal" if cap_gap >= 0 else "inverse")
         else:
             k5.metric("Capacity", "Not set", help="Set it in tab 5 to see a shortfall check here.")
+
+        # show the arithmetic behind the headline number. Without this it's impossible to tell
+        # from the dashboard whether a logged event or override actually reached the total --
+        # you'd have to compare against a number you no longer have.
+        _base_only = sum(type_level_forecasts.values()) if type_level_forecasts else 0
+        _event_delta = pipeline_total_next_week
+        _override_delta = next_week_kg_all - _base_only - _event_delta
+        if abs(_event_delta) > 0.5 or abs(_override_delta) > 0.5:
+            with st.expander("How this total is built up"):
+                _parts = [{"Component": "Statistical forecast (three segments)", "kg": round(_base_only, 1)}]
+                if abs(_event_delta) > 0.5:
+                    _parts.append({"Component": "Pipeline events (converted to weekly)", "kg": round(_event_delta, 1)})
+                if abs(_override_delta) > 0.5:
+                    _parts.append({"Component": "Manual overrides", "kg": round(_override_delta, 1)})
+                _parts.append({"Component": "TOTAL (the number above)", "kg": round(next_week_kg_all, 1)})
+                st.dataframe(pd.DataFrame(_parts), use_container_width=True, hide_index=True)
+                if abs(_event_delta) > 0.5:
+                    st.caption(f"Events are logged per month and converted to a weekly figure "
+                               f"(÷ 4.345), which is why a {_event_delta * 4.345:,.0f} kg/month event "
+                               f"shows here as {_event_delta:,.0f} kg for one week.")
+        elif not applicable.empty or not active_overrides.empty:
+            st.warning("You have logged events or overrides, but they aren't changing this total. "
+                       "Check that the Channel and Item spelling matches your sales data exactly — "
+                       "the Pipeline tab has a before/after table that shows whether each event is landing.")
 
         st.caption("Solid blue line is **actual** historical sales, whole company. Dashed line (Week view "
                    "only) is what the auto-forecast would have predicted for each of the last 12 weeks, "
@@ -2192,7 +2230,21 @@ with tab_dash:
                 st.session_state["show_staple_breakdown"] = True
 
             if st.session_state.get("show_staple_breakdown"):
-                breakdown_df = compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M")
+                # per-segment adjustment for events + overrides, expressed MONTHLY because
+                # this view is monthly. type_level_forecasts_with_pipeline already has both
+                # folded in at weekly scale, so the difference from the raw statistical
+                # forecast is exactly the adjustment -- scaled up by weeks-per-month.
+                _seg_adjust = {}
+                if type_level_forecasts:
+                    for _lab, _base in type_level_forecasts.items():
+                        _adj_weekly = type_level_forecasts_with_pipeline.get(_lab, _base) - _base
+                        if abs(_adj_weekly) > 0.01:
+                            _seg_adjust[_lab] = _adj_weekly * 4.345
+                if _seg_adjust:
+                    st.info("This breakdown includes your logged events and manual overrides: "
+                            + ", ".join(f"{k} {v:+,.0f} kg/mo" for k, v in _seg_adjust.items()))
+                breakdown_df = compute_all_channel_bag_breakdown(
+                    sales_df, n_periods=3, freq="M", segment_adjust=_seg_adjust)
                 if breakdown_df.empty:
                     st.info("Not enough history yet for this breakdown.")
                 else:
@@ -3660,7 +3712,20 @@ with tab_salesplan:
             if len(company_monthly_agg) >= 2:
                 with st.spinner("Computing demand-sensing projection for remaining months..."):
                     proj_recon = project_forward_with_range(company_monthly_agg["kg"].tolist(), None,
-                                                              n_periods=min(len(missing_months) + 3, 12))
+                                                              n_periods=min(len(missing_months) + 3, 12),
+                                                              keep_trend=True)
+                # apply events + overrides here too, so plan-vs-reality compares the plan
+                # against the SAME forward number the rest of the app shows -- otherwise a
+                # signed contract would look like a plan gap rather than expected volume
+                _monthly_adj = 0.0
+                if type_level_forecasts:
+                    for _lab, _base in type_level_forecasts.items():
+                        _monthly_adj += (type_level_forecasts_with_pipeline.get(_lab, _base) - _base)
+                _monthly_adj *= 4.345
+                if abs(_monthly_adj) > 0.5:
+                    proj_recon = proj_recon.copy()
+                    proj_recon["forecast_kg"] = (proj_recon["forecast_kg"] + _monthly_adj).clip(lower=0)
+                    st.caption(f"Projection includes logged events and overrides ({_monthly_adj:+,.0f} kg/mo).")
                 last_month = pd.Period(company_monthly_agg["month"].iloc[-1], freq="M")
                 proj_months = [(last_month + i + 1).strftime("%Y-%m") for i in range(len(proj_recon))]
                 proj_lookup = dict(zip(proj_months, proj_recon["forecast_kg"]))

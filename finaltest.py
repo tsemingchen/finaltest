@@ -3508,10 +3508,25 @@ with tab_salesplan:
             _year = st.number_input("Plan year", min_value=2000, max_value=2100,
                                      value=int(pd.Timestamp(_month_cols[0]).year), key="wide_year")
             if st.button("Import this plan", type="primary"):
-                _long = _raw.melt(id_vars=[_label_col], value_vars=_month_cols,
-                                   var_name="month_dt", value_name="value")
-                _long = _long.dropna(subset=["value"])
-                _long = _long[pd.to_numeric(_long["value"], errors="coerce").notna()]
+                # built row by row rather than with melt: the template can contain duplicate
+                # or unnamed column headers, and melt fails on those with an unhelpful
+                # internal pandas error. This is slower but predictable.
+                _records = []
+                for _pos, _mc in enumerate(_month_cols):
+                    _col_idx = list(_raw.columns).index(_mc) if list(_raw.columns).count(_mc) == 1 else None
+                    _series = _raw.iloc[:, _col_idx] if _col_idx is not None else _raw[_mc].iloc[:, 0]
+                    for _ri, _val in enumerate(_series):
+                        _num = pd.to_numeric(_val, errors="coerce")
+                        if pd.isna(_num):
+                            continue
+                        _records.append({
+                            _label_col: _raw[_label_col].iloc[_ri] if _label_col in _raw.columns else None,
+                            "month_dt": _mc,
+                            "value": float(_num),
+                        })
+                _long = pd.DataFrame(_records)
+                if not _long.empty:
+                    _long = _long.dropna(subset=[_label_col])
                 if _long.empty:
                     st.warning("No numeric values found in those month columns — the sheet may still be "
                                "an empty template.")
@@ -3696,8 +3711,14 @@ with tab_pipeline:
             expected_kg_raw = st.number_input(
                 "Expected kg impact", step=1.0,
                 help="Positive for new/growing business, negative for a lost account.")
-            starting_cycle = st.text_input("Starting cycle", value=cycle,
-                                            help="Which cycle this first applies to, e.g. 2026-08")
+            start_date = st.date_input(
+                "Starts on", value=datetime.now().date(),
+                help="The date this actually begins — e.g. the day a new account's first order "
+                     "ships. The event counts from this date forward; it won't affect any week "
+                     "before it.")
+            # stored as the month label the rest of the app already keys on, so the date is a
+            # friendlier way to say the same thing rather than a schema change
+            starting_cycle = start_date.strftime("%Y-%m")
             ongoing = st.checkbox("Ongoing (keeps applying to future cycles)", value=True,
                                    help="Uncheck for a one-time event that only affects this one cycle.")
             submitted_by = st.text_input("Logged by")
@@ -3731,6 +3752,45 @@ with tab_pipeline:
                 use_container_width=True)
             total_pipeline_kg = applicable["expected_kg_per_month"].sum()
             st.metric("Total pipeline adjustment this cycle", f"{total_pipeline_kg:+,.0f} kg")
+
+            # An event is a stand-in for volume the model can't see YET. Once real sales for
+            # that scope start arriving, the model learns the new level on its own -- and
+            # leaving the event on then double-counts it. This flags when that's happened so
+            # you know it's safe to turn off, rather than having to remember.
+            if has_data and not weekly_actual.empty:
+                _ready = []
+                for _, ev in applicable.iterrows():
+                    _scope = weekly_actual.copy()
+                    for dim in ("channel", "product"):
+                        if dim in ev and pd.notna(ev.get(dim)) and str(ev[dim]) not in ("", "(all)"):
+                            _scope = _scope[_scope[dim] == ev[dim]]
+                    if _scope.empty:
+                        continue
+                    _start_month = str(ev.get("starting_cycle", ""))
+                    _after = _scope[_scope["week_start"].astype(str) >= f"{_start_month}-01"]
+                    _weeks_of_actuals = _after["week_start"].nunique()
+                    if _weeks_of_actuals >= 4:
+                        _expected_weekly = float(ev["expected_kg_per_month"]) / 4.345
+                        _before = _scope[_scope["week_start"].astype(str) < f"{_start_month}-01"]
+                        if _before.empty:
+                            continue
+                        _base = _before.groupby("week_start")["actual_kg"].sum().tail(8).mean()
+                        _now = _after.groupby("week_start")["actual_kg"].sum().mean()
+                        _observed_lift = _now - _base
+                        # has the real lift caught up to at least half what the event predicted?
+                        if _expected_weekly != 0 and _observed_lift / _expected_weekly >= 0.5:
+                            _ready.append({
+                                "Event": f"{ev.get('customer') or ''} {ev.get('channel') or ''} "
+                                         f"{ev.get('product') or ''}".strip(),
+                                "Weeks of real data since start": _weeks_of_actuals,
+                                "Event predicted (kg/wk)": round(_expected_weekly, 1),
+                                "Actually observed (kg/wk)": round(_observed_lift, 1),
+                            })
+                if _ready:
+                    st.warning(f"{len(_ready)} event(s) now show up in real sales data. The forecast has "
+                               "learned this volume on its own, so leaving the event on double-counts it "
+                               "— worth turning these off.")
+                    st.dataframe(pd.DataFrame(_ready), use_container_width=True, hide_index=True)
 
             st.markdown("**Is this actually changing the forecast? Here's the before/after.**")
             if not live_forecast.empty:

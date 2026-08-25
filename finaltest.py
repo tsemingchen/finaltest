@@ -1426,6 +1426,32 @@ def walk_forward_segment(segment_df, n_periods=12, freq="W"):
 
 
 @st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def event_adjustment_by_period(all_events, periods, freq="W"):
+    """Weekly (or monthly) kg adjustment from pipeline events, per period, honouring each
+    event's own start date. Used so the historical forecast line and the accuracy number
+    reflect what the app ACTUALLY predicted at the time -- including any logged event --
+    rather than a pure statistical number nobody ever saw. Grading a forecast that was never
+    shown makes the accuracy figure meaningless for judging real decisions."""
+    out = {p: 0.0 for p in periods}
+    if all_events is None or all_events.empty:
+        return out
+    per = 4.345 if freq == "W" else 1.0  # events are stored monthly
+    for _, ev in all_events.iterrows():
+        start = str(ev.get("starting_cycle") or "")
+        if not start:
+            continue
+        kg = float(ev.get("expected_kg_per_month") or 0) / per
+        ongoing = int(ev.get("ongoing") or 0) == 1
+        for p in periods:
+            p_month = str(p)[:7]
+            if p_month < start:
+                continue
+            if not ongoing and p_month != start:
+                continue
+            out[p] += kg
+    return out
+
+
 def walk_forward_all_segments(sales_df, n_periods=12, freq="W"):
     """Whole-company walk-forward history, built by summing the SAME three per-segment
     calculations the segment tables show. Real bug this fixes: the Overview chart was still
@@ -1903,6 +1929,13 @@ with tab_dash:
             # of its own, which is a third distinct method -- so the accuracy number was
             # grading a forecast that appeared nowhere else in the app.
             acc_wf = walk_forward_all_segments(sales_df, n_periods=6, freq="W")
+            if not acc_wf.empty:
+                # add back what any logged event contributed in each of those weeks, so this
+                # grades the forecast the app actually displayed rather than a pure
+                # statistical number that was never shown to anyone
+                _acc_adj = event_adjustment_by_period(all_events, acc_wf["period"].tolist(), freq="W")
+                acc_wf = acc_wf.copy()
+                acc_wf["forecast_kg"] = acc_wf["forecast_kg"] + acc_wf["period"].map(_acc_adj).fillna(0)
             acc_map = dict(zip(acc_wf["period"], acc_wf["forecast_kg"])) if not acc_wf.empty else {}
 
             def _week_accuracy(idx):
@@ -1997,6 +2030,12 @@ with tab_dash:
         # function, so they can't drift apart again.
         wf_freq = "W" if trend_freq == "Week" else "M"
         topdown_bt = walk_forward_all_segments(sales_df, n_periods=26, freq=wf_freq)
+        if not topdown_bt.empty:
+            # same reasoning as the accuracy KPI -- the dashed line should show what was
+            # actually forecast at the time, events included
+            _bt_adj = event_adjustment_by_period(all_events, topdown_bt["period"].tolist(), freq=wf_freq)
+            topdown_bt = topdown_bt.copy()
+            topdown_bt["forecast_kg"] = topdown_bt["forecast_kg"] + topdown_bt["period"].map(_bt_adj).fillna(0)
         total_bt = trend_agg.rename(columns={"period": "week_start", "kg": "actual_kg"}).merge(
             topdown_bt.rename(columns={"period": "week_start"}), on="week_start", how="inner")
         total_bt["variance_pct"] = (total_bt["actual_kg"] - total_bt["forecast_kg"]) / total_bt["forecast_kg"].replace(0, np.nan)

@@ -1634,12 +1634,56 @@ def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_tre
 # ===================================================================
 # GLOBAL STATE
 # ===================================================================
-st.title("Sales to operations demand planning")
-cycle = st.text_input("Planning cycle label", value=current_cycle_label(),
-                       help="e.g. 2026-08 -- used for pipeline events and ops capacity/sign-off.")
-
 sales_df = load_sales_records()
 has_data = not sales_df.empty
+
+# brand styling -- 49th Parallel's teal and typography, so this reads as a company tool
+# rather than a generic dashboard
+st.markdown("""
+<style>
+  :root { --p49-teal:#2F6F6B; --p49-ink:#1A1A1A; }
+  .p49-header { display:flex; align-items:center; gap:16px; border-bottom:3px solid var(--p49-teal);
+                padding-bottom:14px; margin-bottom:6px; }
+  .p49-mark { font-family:Georgia,'Times New Roman',serif; line-height:1; text-align:center;
+              color:var(--p49-ink); border-right:1px solid #d8d8d8; padding-right:16px; }
+  .p49-mark .n { font-size:34px; font-weight:700; letter-spacing:1px; }
+  .p49-mark .w { font-size:11px; letter-spacing:4px; margin-top:2px; }
+  .p49-mark .s { font-size:7px; letter-spacing:2.5px; color:#666; margin-top:2px; }
+  .p49-title { font-size:30px; font-weight:700; color:var(--p49-ink); line-height:1.15; }
+  .p49-sub { font-size:13px; color:var(--p49-teal); font-weight:600; letter-spacing:.5px; }
+  div.stButton > button[kind="primary"] { background-color:var(--p49-teal); border-color:var(--p49-teal); }
+  div.stButton > button[kind="primary"]:hover { background-color:#255955; border-color:#255955; }
+  [data-testid="stMetricValue"] { color:var(--p49-ink); }
+</style>
+<div class="p49-header">
+  <div class="p49-mark">
+    <div class="n">49<sup style="font-size:14px">TH</sup></div>
+    <div class="w">PARALLEL</div>
+    <div class="s">COFFEE ROASTERS</div>
+  </div>
+  <div>
+    <div class="p49-title">Sales to Operations Demand Planning</div>
+    <div class="p49-sub">S&amp;OP &middot; FORECAST &middot; CAPACITY</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# default the cycle to the month of the most recent data, not today's date -- if the latest
+# upload covers July, the planning cycle should say July, otherwise events and sign-offs get
+# filed against a month with no data in it
+_default_cycle = current_cycle_label()
+if has_data:
+    _d = pd.to_datetime(sales_df["record_date"], errors="coerce").dropna()
+    if not _d.empty:
+        _default_cycle = _d.max().strftime("%Y-%m")
+cycle = st.text_input("Planning cycle label", value=_default_cycle,
+                       help="Defaults to the month of your most recent sales data, so events and "
+                            "sign-offs are filed against the period you're actually planning.")
+if has_data:
+    _d2 = pd.to_datetime(sales_df["record_date"], errors="coerce").dropna()
+    if not _d2.empty:
+        st.caption(f"Data loaded covers {_d2.min().strftime('%b %d, %Y')} to "
+                   f"{_d2.max().strftime('%b %d, %Y')} ({_d2.dt.to_period('M').nunique()} months).")
 
 if has_data:
     price_df = compute_price_per_kg(sales_df)
@@ -1990,8 +2034,10 @@ with tab_dash:
         _base_only = sum(type_level_forecasts.values()) if type_level_forecasts else 0
         _event_delta = pipeline_total_next_week
         _override_delta = next_week_kg_all - _base_only - _event_delta
-        if abs(_event_delta) > 0.5 or abs(_override_delta) > 0.5:
-            with st.expander("How this total is built up"):
+        # always shown -- this is the "where does this number come from" answer, and it's
+        # the first thing anyone asks in a planning meeting
+        if True:
+            with st.expander("How this total is built up", expanded=False):
                 _parts = [{"Component": "Statistical forecast (three segments)", "kg": round(_base_only, 1)}]
                 if abs(_event_delta) > 0.5:
                     _parts.append({"Component": "Pipeline events (converted to weekly)", "kg": round(_event_delta, 1)})
@@ -1999,6 +2045,12 @@ with tab_dash:
                     _parts.append({"Component": "Manual overrides", "kg": round(_override_delta, 1)})
                 _parts.append({"Component": "TOTAL (the number above)", "kg": round(next_week_kg_all, 1)})
                 st.dataframe(pd.DataFrame(_parts), use_container_width=True, hide_index=True)
+                if type_level_forecasts:
+                    st.caption("The statistical forecast is the sum of three independently modelled "
+                               "segments: " + ", ".join(
+                                   f"{k} {v:,.0f} kg" for k, v in type_level_forecasts.items()) + ".")
+                if abs(_event_delta) < 0.5 and abs(_override_delta) < 0.5:
+                    st.caption("No pipeline events or manual overrides are currently affecting this number.")
                 if abs(_event_delta) > 0.5:
                     st.caption(f"Events are logged per month and converted to a weekly figure "
                                f"(÷ 4.345), which is why a {_event_delta * 4.345:,.0f} kg/month event "

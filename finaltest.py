@@ -214,6 +214,7 @@ def get_conn():
     # silently stops applying when this ships.
     try:
         conn.execute("ALTER TABLE pipeline_events ADD COLUMN IF NOT EXISTS active INTEGER DEFAULT 1")
+        conn.execute("ALTER TABLE pipeline_events ADD COLUMN IF NOT EXISTS deactivated_at TEXT")
         conn.execute("UPDATE pipeline_events SET active = 1 WHERE active IS NULL")
         conn.commit()
     except Exception:
@@ -1047,7 +1048,7 @@ def compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M", segment_a
         series = agg["actual_kg"].tolist()
         if len(series) < 2:
             continue
-        proj = project_forward_with_range(series, None, n_periods=n_periods, keep_trend=(freq == "M"))
+        proj = project_forward_with_range(series, None, n_periods=n_periods, keep_trend=True)
         if proj.empty:
             continue
         ch_shares = compute_trending_shares(seg_df, ["channel"], freq=freq)
@@ -1451,9 +1452,15 @@ def event_adjustment_by_period(all_events, periods, freq="W"):
             continue
         kg = float(ev.get("expected_kg_per_month") or 0) / per
         ongoing = int(ev.get("ongoing") or 0) == 1
+        # an event that was later stopped still counted for the weeks it was live. Honouring
+        # that window is what stops turning an event off from retroactively rewriting past
+        # forecasts and past accuracy -- the record stays as it was actually reported.
+        stopped = str(ev.get("deactivated_at") or "")[:7] if ev.get("deactivated_at") else None
         for p in periods:
             p_month = str(p)[:7]
             if p_month < start:
+                continue
+            if stopped and p_month > stopped:
                 continue
             if not ongoing and p_month != start:
                 continue
@@ -1876,7 +1883,7 @@ else:
 # ===================================================================
 tab_dash, tab_data, tab_rates, tab_forecast, tab_salesplan, tab_pipeline, tab_ops, tab_signoff, tab_ai, tab_history = st.tabs(
     ["Dashboard", "1. Upload sales data", "2. Computed rates", "3. Forecast (auto)",
-     "4. Sales plan (S&OP)", "5. Pipeline / known events", "6. Ops capacity check", "7. Sign-off", "8. Ask AI", "9. History"]
+     "4. Sales plan (S&OP)", "5. Adjust the forecast", "6. Ops capacity check", "7. Sign-off", "8. Ask AI", "9. History"]
 )
 
 # --- DASHBOARD (landing page) ---
@@ -1993,7 +2000,7 @@ with tab_dash:
                 # add back what any logged event contributed in each of those weeks, so this
                 # grades the forecast the app actually displayed rather than a pure
                 # statistical number that was never shown to anyone
-                _acc_adj = event_adjustment_by_period(all_events, acc_wf["period"].tolist(), freq="W")
+                _acc_adj = event_adjustment_by_period(all_events_all, acc_wf["period"].tolist(), freq="W")
                 acc_wf = acc_wf.copy()
                 acc_wf["forecast_kg"] = acc_wf["forecast_kg"] + acc_wf["period"].map(_acc_adj).fillna(0)
             acc_map = dict(zip(acc_wf["period"], acc_wf["forecast_kg"])) if not acc_wf.empty else {}
@@ -2101,7 +2108,7 @@ with tab_dash:
         if not topdown_bt.empty:
             # same reasoning as the accuracy KPI -- the dashed line should show what was
             # actually forecast at the time, events included
-            _bt_adj = event_adjustment_by_period(all_events, topdown_bt["period"].tolist(), freq=wf_freq)
+            _bt_adj = event_adjustment_by_period(all_events_all, topdown_bt["period"].tolist(), freq=wf_freq)
             topdown_bt = topdown_bt.copy()
             topdown_bt["forecast_kg"] = topdown_bt["forecast_kg"] + topdown_bt["period"].map(_bt_adj).fillna(0)
         total_bt = trend_agg.rename(columns={"period": "week_start", "kg": "actual_kg"}).merge(
@@ -2115,7 +2122,7 @@ with tab_dash:
             with st.spinner("Projecting the trend forward..."):
                 projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma,
                                                         n_periods=n_periods_fwd,
-                                                        keep_trend=(trend_freq == "Month"))
+                                                        keep_trend=True)
         else:
             projection = pd.DataFrame()
 
@@ -2231,7 +2238,7 @@ with tab_dash:
 
                     projection_pt = project_forward_with_range(
                         agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown,
-                        keep_trend=(freq == "M"))
+                        keep_trend=True)
 
                     # anchor period 1 to the SAME single-step forecast that feeds the Overview
                     # KPI total -- guarantees this table's first period matches the top of the
@@ -2799,7 +2806,7 @@ with tab_dash:
             try:
                 _rep_bt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
                 if not _rep_bt.empty:
-                    _rep_adj = event_adjustment_by_period(all_events, _rep_bt["period"].tolist(), freq="W")
+                    _rep_adj = event_adjustment_by_period(all_events_all, _rep_bt["period"].tolist(), freq="W")
                     _rep_bt = _rep_bt.copy()
                     _rep_bt["forecast_kg"] = _rep_bt["forecast_kg"] + _rep_bt["period"].map(_rep_adj).fillna(0)
                     trend_fig.add_trace(go.Scatter(
@@ -2883,6 +2890,40 @@ th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
                         pdf.cell(w, 6, safe(str(v))[:30], border=1)
                     pdf.ln()
 
+            def draw_line_chart(title, series_list, width=180, height=70):
+                """Hand-drawn multi-series line chart -- fpdf has no charting and rendering a
+                plotly image would need a headless browser, which isn't available here. Same
+                content as the HTML report's chart, drawn with primitives."""
+                pdf.ln(4)
+                pdf.set_font("Helvetica", "B", 12)
+                pdf.cell(0, 8, safe(title), new_x="LMARGIN", new_y="NEXT")
+                _all = [v for _, ys, _ in series_list for v in ys if v is not None]
+                if not _all:
+                    pdf.set_font("Helvetica", "", 9)
+                    pdf.cell(0, 6, "No data available.", new_x="LMARGIN", new_y="NEXT")
+                    return
+                lo, hi = min(_all), max(_all)
+                span = (hi - lo) or 1
+                x0, y0 = pdf.get_x(), pdf.get_y()
+                pdf.set_draw_color(210, 210, 210)
+                pdf.rect(x0, y0, width, height)
+                n_max = max(len(ys) for _, ys, _ in series_list)
+                for name, ys, rgb in series_list:
+                    pdf.set_draw_color(*rgb)
+                    pts = [(x0 + (i / max(n_max - 1, 1)) * width,
+                            y0 + height - ((v - lo) / span) * height)
+                           for i, v in enumerate(ys) if v is not None]
+                    for a, b in zip(pts, pts[1:]):
+                        pdf.line(a[0], a[1], b[0], b[1])
+                pdf.set_y(y0 + height + 2)
+                pdf.set_font("Helvetica", "", 7)
+                pdf.set_text_color(90, 90, 90)
+                pdf.cell(0, 4, safe("  |  ".join(f"{n}" for n, _, _ in series_list)
+                                    + f"   (range {lo:,.0f} - {hi:,.0f} kg)"),
+                         new_x="LMARGIN", new_y="NEXT")
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_draw_color(0, 0, 0)
+
             def draw_bar_chart(title, labels, values, chart_width=180, bar_height=6, gap=2):
                 """Hand-drawn horizontal bar chart -- no image rendering, no Chrome needed."""
                 pdf.ln(4)
@@ -2909,21 +2950,31 @@ th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
                     pdf.set_x(x0)
                     pdf.set_y(y0 + bar_height + gap)
 
+            # same two charts as the HTML report: actual-vs-backtested trend, then the
+            # on-screen breakdown. Tables intentionally omitted -- this report is charts only.
             if not report_trend_df.empty:
-                recent_trend = report_trend_df.tail(12)
-                draw_bar_chart("Overall trend — actual kg, last 12 weeks",
-                                recent_trend["period"].tolist(), recent_trend["kg"].tolist())
+                _tr = report_trend_df.tail(26)
+                _series = [("Actual", _tr["kg"].tolist(), (31, 119, 180))]
+                try:
+                    _pbt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
+                    if not _pbt.empty:
+                        _padj = event_adjustment_by_period(all_events_all, _pbt["period"].tolist(), freq="W")
+                        _pbt = _pbt.copy()
+                        _pbt["forecast_kg"] = _pbt["forecast_kg"] + _pbt["period"].map(_padj).fillna(0)
+                        _m = _tr[["period"]].merge(_pbt, on="period", how="left")
+                        _series.append(("Auto forecast (backtested)",
+                                        _m["forecast_kg"].tolist(), (139, 90, 60)))
+                except Exception:
+                    pass
+                draw_line_chart("Overall trend - actual vs forecast", _series)
 
-            if not report_bar_df.empty:
-                bar_top = report_bar_df.sort_values("forecast_kg", ascending=False).head(12)
-                draw_bar_chart("Forecast by segment (top 12)",
-                                (bar_top["channel"] + " - " + bar_top["product"]).tolist(),
-                                bar_top["forecast_kg"].tolist())
+            _pbd = st.session_state.get("_report_breakdown")
+            if _pbd is not None and not _pbd.empty:
+                _bt2 = _pbd.sort_values("forecast_kg", ascending=False).head(12)
+                draw_bar_chart(
+                    f"Forecast breakdown - by {st.session_state.get('_report_breakdown_label', 'segment')}",
+                    _bt2["Segment"].astype(str).tolist(), _bt2["forecast_kg"].tolist())
 
-            draw_table("Translated forecast - kg and CAD",
-                       report_dollar_df.assign(**{"Forecast (CAD)": report_dollar_df["Forecast (CAD)"].map(lambda x: f"${x:,.0f}")}) if not report_dollar_df.empty else report_dollar_df,
-                       [45, 60, 30, 30])
-            draw_table("Forecast accuracy overview", report_overview_df, [40, 50, 25, 25, 25, 20])
             pdf.add_page()
             draw_table("Forecast accuracy - MAPE and bias", report_accuracy_df, [45, 55, 25, 25, 30])
 
@@ -2962,19 +3013,52 @@ th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
 
             # trend chart -- native Excel line chart, built from real data written into the sheet
             ws_trend = wb.create_sheet("Overall Trend")
-            trend_for_excel = report_trend_df.rename(columns={"period": "Week", "kg": "Total kg"})
+            trend_for_excel = report_trend_df.rename(columns={"period": "Week", "kg": "Actual kg"})
+            # add the backtested forecast as a second series, so Excel shows the same
+            # actual-vs-forecast picture as the HTML and PDF reports
+            try:
+                _xbt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
+                if not _xbt.empty:
+                    _xadj = event_adjustment_by_period(all_events_all, _xbt["period"].tolist(), freq="W")
+                    _xbt = _xbt.copy()
+                    _xbt["forecast_kg"] = _xbt["forecast_kg"] + _xbt["period"].map(_xadj).fillna(0)
+                    trend_for_excel = trend_for_excel.merge(
+                        _xbt.rename(columns={"period": "Week", "forecast_kg": "Auto forecast kg"}),
+                        on="Week", how="left")
+            except Exception:
+                pass
             write_df(ws_trend, trend_for_excel)
             if len(trend_for_excel) > 1:
                 chart1 = LineChart()
-                chart1.title = "Overall trend — actual kg"
+                chart1.title = "Overall trend - actual vs forecast"
                 chart1.y_axis.title = "Total kg"
                 chart1.x_axis.title = "Week"
-                data_ref = Reference(ws_trend, min_col=2, min_row=1, max_row=len(trend_for_excel) + 1)
+                _ncols = len(trend_for_excel.columns)
+                data_ref = Reference(ws_trend, min_col=2, max_col=_ncols,
+                                      min_row=1, max_row=len(trend_for_excel) + 1)
                 cats_ref = Reference(ws_trend, min_col=1, min_row=2, max_row=len(trend_for_excel) + 1)
                 chart1.add_data(data_ref, titles_from_data=True)
                 chart1.set_categories(cats_ref)
-                chart1.width, chart1.height = 24, 10
-                ws_trend.add_chart(chart1, "D2")
+                chart1.width, chart1.height = 26, 11
+                ws_trend.add_chart(chart1, f"{openpyxl.utils.get_column_letter(_ncols + 2)}2")
+
+            # breakdown chart -- the same on-screen slice the other two formats show
+            _xbd = st.session_state.get("_report_breakdown")
+            if _xbd is not None and not _xbd.empty:
+                ws_bd = wb.create_sheet("Breakdown")
+                _bd_x = _xbd.sort_values("forecast_kg", ascending=False).rename(
+                    columns={"forecast_kg": "Forecast kg"})
+                write_df(ws_bd, _bd_x)
+                chart_bd = BarChart()
+                chart_bd.type = "bar"
+                chart_bd.title = f"Forecast breakdown - by {st.session_state.get('_report_breakdown_label', 'segment')}"
+                chart_bd.x_axis.title = "Forecast kg"
+                d_ref = Reference(ws_bd, min_col=2, min_row=1, max_row=len(_bd_x) + 1)
+                c_ref = Reference(ws_bd, min_col=1, min_row=2, max_row=len(_bd_x) + 1)
+                chart_bd.add_data(d_ref, titles_from_data=True)
+                chart_bd.set_categories(c_ref)
+                chart_bd.width, chart_bd.height = 24, max(10, 0.5 * len(_bd_x))
+                ws_bd.add_chart(chart_bd, "D2")
 
             ws2 = wb.create_sheet("Translated Forecast")
             if not report_dollar_df.empty:
@@ -3492,8 +3576,438 @@ with tab_forecast:
                 st.dataframe(translated, use_container_width=True)
             st.download_button("Download forecast_by_size.csv", translated.to_csv(index=False), "forecast_by_size.csv")
 
+with tab_salesplan:
+    st.subheader("Sales plan — the top-down half of the S&OP bridge")
+    st.caption(
+        "This is Sales' own forward-looking plan — entered by month, channel, and item — translated "
+        "into kg using the same price/kg rates used everywhere else in this app. It's compared against "
+        "the app's own demand-sensing forecast below, so a gap between 'what Sales planned' and "
+        "'what's actually happening' is visible early, not discovered at year-end."
+    )
+
+    plan_year = st.text_input("Plan year", value=str(date.today().year), key="plan_year")
+
+    st.markdown("### Upload a plan (bulk)")
+    plan_layout = st.radio(
+        "How is your plan laid out?",
+        ["Wide — months across the top (our standard template)", "Long — one row per channel/month"],
+        help="The company revenue template has channels down the side and one column per month. "
+             "Pick 'Wide' for that; the app will unpivot it for you.")
+    plan_file = st.file_uploader("CSV or Excel", type=["csv", "xlsx", "xls"], key="plan_upload")
+
+    if plan_file is not None and plan_layout.startswith("Wide"):
+        _raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
+        st.dataframe(_raw.head(8), use_container_width=True)
+        _label_col = st.selectbox("Which column holds the channel names?", list(_raw.columns), key="wide_label")
+        # month columns are the ones that parse as real dates -- the template uses actual
+        # datetime headers, so this identifies them without asking the user to list them
+        _month_cols = [col for col in _raw.columns
+                       if isinstance(col, (datetime, pd.Timestamp))]
+        if not _month_cols:
+            st.warning("No date-style column headers found. If your months are text (e.g. 'Jan 2026'), "
+                       "use the 'Long' layout instead, or reformat the headers as dates.")
+        else:
+            st.caption(f"Found {len(_month_cols)} month columns: "
+                       f"{pd.Timestamp(_month_cols[0]).strftime('%b %Y')} to "
+                       f"{pd.Timestamp(_month_cols[-1]).strftime('%b %Y')}")
+            _unit = st.radio("These values are:", ["Revenue ($)", "Volume (kg)"], horizontal=True, key="wide_unit")
+            _year = st.number_input("Plan year", min_value=2000, max_value=2100,
+                                     value=int(pd.Timestamp(_month_cols[0]).year), key="wide_year")
+            if st.button("Import this plan", type="primary"):
+                # built row by row rather than with melt: the template can contain duplicate
+                # or unnamed column headers, and melt fails on those with an unhelpful
+                # internal pandas error. This is slower but predictable.
+                _records = []
+                for _pos, _mc in enumerate(_month_cols):
+                    _col_idx = list(_raw.columns).index(_mc) if list(_raw.columns).count(_mc) == 1 else None
+                    _series = _raw.iloc[:, _col_idx] if _col_idx is not None else _raw[_mc].iloc[:, 0]
+                    for _ri, _val in enumerate(_series):
+                        _num = pd.to_numeric(_val, errors="coerce")
+                        if pd.isna(_num):
+                            continue
+                        _records.append({
+                            _label_col: _raw[_label_col].iloc[_ri] if _label_col in _raw.columns else None,
+                            "month_dt": _mc,
+                            "value": float(_num),
+                        })
+                _long = pd.DataFrame(_records)
+                if not _long.empty:
+                    _long = _long.dropna(subset=[_label_col])
+                if _long.empty:
+                    st.warning("No numeric values found in those month columns — the sheet may still be "
+                               "an empty template.")
+                else:
+                    _long["month"] = pd.to_datetime(_long["month_dt"]).dt.month
+                    _long["channel"] = _long[_label_col].astype(str).str.strip()
+                    _long["product"] = "(all)"
+                    _long["value"] = pd.to_numeric(_long["value"], errors="coerce")
+                    rows_written = 0
+                    for _, r in _long.iterrows():
+                        _kg = _rev = None
+                        if _unit.startswith("Revenue"):
+                            _rev = float(r["value"])
+                        else:
+                            _kg = float(r["value"])
+                        conn.execute("""INSERT INTO sales_plan
+                            (plan_year, month, channel, product, planned_kg, planned_dollars, updated_by, updated_at, note)
+                            VALUES (?,?,?,?,?,?,?,?,?)""",
+                            (str(_year), f"{int(r['month']):02d}", r["channel"], r["product"],
+                             _kg, _rev, "wide import", datetime.now().isoformat(), "imported from template"))
+                        rows_written += 1
+                    conn.commit()
+                    st.success(f"Imported {rows_written} plan rows from the wide template.")
+                    st.rerun()
+        plan_file = None  # handled above; skip the long-format path below
+
+    if plan_file is not None:
+        plan_raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
+        st.dataframe(plan_raw.head(), use_container_width=True)
+        pcols = list(plan_raw.columns)
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            plan_channel_col = st.selectbox("Channel column", pcols, key="plan_channel_col")
+            plan_month_col = st.selectbox("Month column", pcols, key="plan_month_col")
+        with pc2:
+            plan_product_col = st.selectbox("Item column", pcols, key="plan_product_col")
+            plan_amount_col = st.selectbox("Planned amount column", pcols, key="plan_amount_col")
+        with pc3:
+            plan_amount_type = st.radio("This amount is in", ["Dollars ($)", "Kilograms (kg)"], key="plan_amount_type")
+
+        if st.button("Save this plan", type="primary"):
+            std_plan = pd.DataFrame()
+            std_plan["channel"] = plan_raw[plan_channel_col].astype(str)
+            std_plan["product"] = plan_raw[plan_product_col].astype(str)
+            std_plan["month"] = plan_raw[plan_month_col].astype(str)
+            if plan_amount_type == "Dollars ($)":
+                std_plan["planned_dollars"] = pd.to_numeric(plan_raw[plan_amount_col], errors="coerce")
+                std_plan["planned_kg"] = np.nan
+            else:
+                std_plan["planned_kg"] = pd.to_numeric(plan_raw[plan_amount_col], errors="coerce")
+                std_plan["planned_dollars"] = np.nan
+            std_plan = std_plan.dropna(subset=["channel", "product", "month"])
+
+            if not price_df.empty:
+                rate_lookup = price_df.groupby(["channel", "product"], as_index=False)["price_per_kg"].mean()
+                std_plan = std_plan.merge(rate_lookup, on=["channel", "product"], how="left")
+                std_plan["planned_kg"] = np.where(
+                    std_plan["planned_kg"].isna() & std_plan["planned_dollars"].notna() & std_plan["price_per_kg"].notna(),
+                    std_plan["planned_dollars"] / std_plan["price_per_kg"], std_plan["planned_kg"])
+                std_plan = std_plan.drop(columns=["price_per_kg"])
+
+            std_plan["plan_year"] = plan_year
+            std_plan["updated_at"] = datetime.now().isoformat()
+            std_plan["updated_by"] = ""
+            std_plan["note"] = ""
+            insert_dataframe("sales_plan", std_plan)
+            st.success(f"Saved {len(std_plan)} plan rows for {plan_year}.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Edit the current plan")
+    st.caption("Add, edit, or delete rows directly — this is how Sales keeps the plan updated over time.")
+    existing_plan = pd.read_sql("SELECT * FROM sales_plan WHERE plan_year = ? ORDER BY month, channel, product",
+                                 conn, params=(plan_year,))
+    edit_base = existing_plan[["channel", "product", "month", "planned_dollars", "planned_kg", "note"]] \
+        if not existing_plan.empty else pd.DataFrame(columns=["channel", "product", "month", "planned_dollars", "planned_kg", "note"])
+
+    # flag rows that would be silently dropped on save, and rows imported without an item --
+    # a wide-template import fills product with "(all)", which is fine, but a blank channel or
+    # month makes the row unusable and was previously just discarded without explanation
+    _bad = edit_base[edit_base[["channel", "month"]].isna().any(axis=1)] if not edit_base.empty else pd.DataFrame()
+    if not _bad.empty:
+        st.warning(f"{len(_bad)} row(s) are missing a channel or month and will be skipped when you "
+                   "save. Fill them in below or delete them.")
+    if not edit_base.empty:
+        _no_val = edit_base[edit_base["planned_dollars"].isna() & edit_base["planned_kg"].isna()]
+        if not _no_val.empty:
+            st.info(f"{len(_no_val)} row(s) have no dollar or kg value yet — they'll save but won't "
+                    "contribute to the plan-vs-reality comparison until you fill one in.")
+
+    edited = st.data_editor(edit_base, num_rows="dynamic", use_container_width=True, key="plan_editor",
+                             column_config={
+                                 "planned_dollars": st.column_config.NumberColumn("Planned $", format="%.0f"),
+                                 "planned_kg": st.column_config.NumberColumn("Planned kg", format="%.1f"),
+                             })
+    updated_by = st.text_input("Your name (for the record)", key="plan_updated_by_input")
+
+    if st.button("Save changes to plan", type="primary"):
+        edited_clean = edited.dropna(subset=["channel", "product", "month"], how="any").copy()
+        if not edited_clean.empty and not price_df.empty:
+            rate_lookup = price_df.groupby(["channel", "product"], as_index=False)["price_per_kg"].mean()
+            edited_clean = edited_clean.merge(rate_lookup, on=["channel", "product"], how="left")
+            edited_clean["planned_kg"] = np.where(
+                edited_clean["planned_kg"].isna() & edited_clean["planned_dollars"].notna() & edited_clean["price_per_kg"].notna(),
+                edited_clean["planned_dollars"] / edited_clean["price_per_kg"], edited_clean["planned_kg"])
+            edited_clean = edited_clean.drop(columns=["price_per_kg"])
+        edited_clean["plan_year"] = plan_year
+        edited_clean["updated_at"] = datetime.now().isoformat()
+        edited_clean["updated_by"] = updated_by
+
+        conn.execute("DELETE FROM sales_plan WHERE plan_year = ?", (plan_year,))
+        conn.commit()
+        if not edited_clean.empty:
+            insert_dataframe("sales_plan", edited_clean)
+        st.success(f"Plan for {plan_year} updated ({len(edited_clean)} rows).")
+        st.rerun()
+
+    st.divider()
+    st.markdown("## Reconciliation — plan vs. reality")
+    st.caption(
+        "For months that already happened, this compares the plan to real actuals. For months still "
+        "ahead, it compares the plan to the app's own demand-sensing projection — which gets less "
+        "certain the further out it looks, unlike the plan (which usually assumes similar confidence "
+        "across the whole year). Treat far-future gaps as a rough signal, not a precise miss."
+    )
+
+    plan_monthly = existing_plan.groupby("month", as_index=False)["planned_kg"].sum() if not existing_plan.empty else pd.DataFrame()
+
+    if plan_monthly.empty:
+        st.info("Enter a plan above to see the reconciliation view.")
+    elif not has_data:
+        st.info("Upload sales history in tab 1 to compare the plan against.")
+    else:
+        actuals_monthly = sales_df.copy()
+        actuals_monthly["record_date"] = pd.to_datetime(actuals_monthly["record_date"], errors="coerce")
+        actuals_monthly["month"] = actuals_monthly["record_date"].dt.to_period("M").astype(str)
+        actuals_monthly = actuals_monthly.groupby("month", as_index=False)["kg"].sum().rename(columns={"kg": "actual_kg"})
+
+        recon = plan_monthly.merge(actuals_monthly, on="month", how="left").sort_values("month")
+        missing_months = recon[recon["actual_kg"].isna()]["month"].tolist()
+
+        recon["demand_sensing_kg"] = np.nan
+        if missing_months:
+            company_monthly = sales_df.copy()
+            company_monthly["record_date"] = pd.to_datetime(company_monthly["record_date"], errors="coerce")
+            company_monthly["month"] = company_monthly["record_date"].dt.to_period("M").astype(str)
+            company_monthly_agg = company_monthly.groupby("month", as_index=False)["kg"].sum().sort_values("month")
+            if len(company_monthly_agg) >= 2:
+                with st.spinner("Computing demand-sensing projection for remaining months..."):
+                    proj_recon = project_forward_with_range(company_monthly_agg["kg"].tolist(), None,
+                                                              n_periods=min(len(missing_months) + 3, 12),
+                                                              keep_trend=True)
+                # apply events + overrides here too, so plan-vs-reality compares the plan
+                # against the SAME forward number the rest of the app shows -- otherwise a
+                # signed contract would look like a plan gap rather than expected volume
+                _monthly_adj = 0.0
+                if type_level_forecasts:
+                    for _lab, _base in type_level_forecasts.items():
+                        _monthly_adj += (type_level_forecasts_with_pipeline.get(_lab, _base) - _base)
+                _monthly_adj *= 4.345
+                if abs(_monthly_adj) > 0.5:
+                    proj_recon = proj_recon.copy()
+                    proj_recon["forecast_kg"] = (proj_recon["forecast_kg"] + _monthly_adj).clip(lower=0)
+                    st.caption(f"Projection includes logged events and overrides ({_monthly_adj:+,.0f} kg/mo).")
+                last_month = pd.Period(company_monthly_agg["month"].iloc[-1], freq="M")
+                proj_months = [(last_month + i + 1).strftime("%Y-%m") for i in range(len(proj_recon))]
+                proj_lookup = dict(zip(proj_months, proj_recon["forecast_kg"]))
+                recon["demand_sensing_kg"] = recon["month"].map(proj_lookup)
+
+        recon["Status"] = np.where(recon["actual_kg"].notna(), "Actual", "Forecast (projected)")
+        recon["Reality (kg)"] = recon["actual_kg"].fillna(recon["demand_sensing_kg"])
+        recon["Gap vs plan (kg)"] = recon["Reality (kg)"] - recon["planned_kg"]
+        recon["Gap %"] = np.where(recon["planned_kg"] != 0, recon["Gap vs plan (kg)"] / recon["planned_kg"] * 100, np.nan)
+
+        display_recon = recon.rename(columns={"month": "Month", "planned_kg": "Plan (kg)"})[
+            ["Month", "Plan (kg)", "Reality (kg)", "Gap vs plan (kg)", "Gap %", "Status"]].round(1)
+        st.dataframe(display_recon, use_container_width=True, hide_index=True)
+
+        fig_recon = go.Figure()
+        fig_recon.add_trace(go.Scatter(x=recon["month"], y=recon["planned_kg"], mode="lines+markers",
+                                        name="Sales plan", line=dict(color="rgb(217,119,6)", width=2)))
+        fig_recon.add_trace(go.Scatter(x=recon["month"], y=recon["Reality (kg)"], mode="lines+markers",
+                                        name="Actual / demand-sensing", line=dict(color="rgb(31,119,180)", width=2)))
+        fig_recon.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
+                                 yaxis_title="kg", hovermode="x unified")
+        st.plotly_chart(fig_recon, use_container_width=True)
+
+# --- TAB: Pipeline / known events ---
+with tab_pipeline:
+    st.subheader("Log what's happening right now — before it shows up in sales data")
+    st.caption(
+        "Signed a new contract? Lost an account? Know volume is about to change? Log it here. "
+        "A trend forecast can't see a deal that hasn't shipped yet — but you already know about it. "
+        "Once logged, it adjusts the forecast automatically, on top of the auto-generated baseline."
+    )
+
+    with st.form("pipeline_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            event_type = st.selectbox("What happened", [
+                "New contract signed", "Account lost / churned", "Expected volume change", "Other"])
+            customer = st.text_input("Customer / account name")
+            channel = st.selectbox("Channel", sorted(sales_df["channel"].unique().tolist())
+                                    if has_data else ["Wholesale", "Retail"])
+            product = st.selectbox("Product", sorted(sales_df["product"].unique().tolist())
+                                    if has_data else ["Product"])
+        with c2:
+            rate_unit = st.radio(
+                "How is this volume expressed?", ["Per month", "Per week"], horizontal=True,
+                help="A new account quoted as 'X kg a month' vs 'X kg a week' are very different "
+                     "amounts — pick whichever way you were told it, and the app converts.")
+            expected_kg_raw = st.number_input(
+                "Expected kg impact", step=1.0, value=0.0,
+                help="Positive for new/growing business, negative for a lost account or a "
+                     "downgrade. Negative values are allowed.")
+            start_date = st.date_input(
+                "Starts on", value=datetime.now().date(),
+                help="The date this actually begins — e.g. the day a new account's first order "
+                     "ships. The event counts from this date forward; it won't affect any week "
+                     "before it.")
+            # stored as the month label the rest of the app already keys on, so the date is a
+            # friendlier way to say the same thing rather than a schema change
+            starting_cycle = start_date.strftime("%Y-%m")
+            ongoing = st.checkbox("Ongoing (keeps applying to future cycles)", value=True,
+                                   help="Uncheck for a one-time event that only affects this one cycle.")
+            submitted_by = st.text_input("Logged by")
+        note = st.text_area("Note (context for whoever reads this later)")
+
+        if st.form_submit_button("Log this event", type="primary"):
+            # store everything as a monthly figure regardless of how it was entered, so there
+            # is exactly one unit in the database and no ambiguity downstream
+            expected_kg = expected_kg_raw * 4.345 if rate_unit == "Per week" else expected_kg_raw
+            conn.execute("""INSERT INTO pipeline_events
+                (timestamp, submitted_by, event_type, customer, channel, product,
+                 expected_kg_per_month, starting_cycle, ongoing, note)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(), submitted_by, event_type, customer, channel, product,
+                 expected_kg, starting_cycle, int(ongoing), note))
+            conn.commit()
+            st.success("Logged — the forecast now includes this.")
+            st.rerun()
+
+    st.divider()
+    if all_events_all.empty:
+        st.info("No events logged yet.")
+    else:
+        st.markdown(f"**Currently applying to cycle {cycle}:**")
+        if applicable.empty:
+            st.caption("None of the logged events apply to this cycle yet.")
+        else:
+            st.dataframe(
+                applicable[["event_type", "customer", "channel", "product",
+                            "expected_kg_per_month", "starting_cycle", "ongoing", "note"]],
+                use_container_width=True)
+            total_pipeline_kg = applicable["expected_kg_per_month"].sum()
+            st.metric("Total pipeline adjustment this cycle", f"{total_pipeline_kg:+,.0f} kg")
+
+            # An event is a stand-in for volume the model can't see YET. Once real sales for
+            # that scope start arriving, the model learns the new level on its own -- and
+            # leaving the event on then double-counts it. This flags when that's happened so
+            # you know it's safe to turn off, rather than having to remember.
+            if has_data and not weekly_actual.empty:
+                _ready = []
+                for _, ev in applicable.iterrows():
+                    _scope = weekly_actual.copy()
+                    for dim in ("channel", "product"):
+                        if dim in ev and pd.notna(ev.get(dim)) and str(ev[dim]) not in ("", "(all)"):
+                            _scope = _scope[_scope[dim] == ev[dim]]
+                    if _scope.empty:
+                        continue
+                    _start_month = str(ev.get("starting_cycle", ""))
+                    _after = _scope[_scope["week_start"].astype(str) >= f"{_start_month}-01"]
+                    _weeks_of_actuals = _after["week_start"].nunique()
+                    if _weeks_of_actuals >= 4:
+                        _expected_weekly = float(ev["expected_kg_per_month"]) / 4.345
+                        _before = _scope[_scope["week_start"].astype(str) < f"{_start_month}-01"]
+                        if _before.empty:
+                            continue
+                        _base = _before.groupby("week_start")["actual_kg"].sum().tail(8).mean()
+                        _now = _after.groupby("week_start")["actual_kg"].sum().mean()
+                        _observed_lift = _now - _base
+                        # has the real lift caught up to at least half what the event predicted?
+                        if _expected_weekly != 0 and _observed_lift / _expected_weekly >= 0.5:
+                            _ready.append({
+                                "Event": f"{ev.get('customer') or ''} {ev.get('channel') or ''} "
+                                         f"{ev.get('product') or ''}".strip(),
+                                "Weeks of real data since start": _weeks_of_actuals,
+                                "Event predicted (kg/wk)": round(_expected_weekly, 1),
+                                "Actually observed (kg/wk)": round(_observed_lift, 1),
+                            })
+                if _ready:
+                    st.warning(f"{len(_ready)} event(s) now show up in real sales data. The forecast has "
+                               "learned this volume on its own, so leaving the event on double-counts it "
+                               "— worth turning these off.")
+                    st.dataframe(pd.DataFrame(_ready), use_container_width=True, hide_index=True)
+
+            st.markdown("**Is this actually changing the forecast? Here's the before/after.**")
+            if not live_forecast.empty:
+                impact = live_forecast[["channel", "product", "forecast_kg"]].rename(
+                    columns={"forecast_kg": "Baseline forecast (kg) — trend only, no events"})
+                impact = impact.merge(pipeline_by_cp, on=["channel", "product"], how="inner")
+                if impact.empty:
+                    st.warning("None of the logged events match a channel/product the trend model currently "
+                               "has a forecast for — double check the Channel and Product you selected when "
+                               "logging the event match what's actually in your uploaded sales data.")
+                else:
+                    impact["Adjusted forecast (kg) — with events"] = (
+                        impact["Baseline forecast (kg) — trend only, no events"] + impact["pipeline_kg"])
+                    impact = impact.rename(columns={"channel": "Channel", "product": "Item",
+                                                     "pipeline_kg": "Event adjustment (kg)"})
+                    st.dataframe(impact[["Channel", "Item", "Baseline forecast (kg) — trend only, no events",
+                                          "Event adjustment (kg)", "Adjusted forecast (kg) — with events"]],
+                                 use_container_width=True)
+                    st.caption("If the baseline and adjusted columns are identical, the event isn't actually "
+                               "reaching this channel/product — check the Channel/Product spelling matches "
+                               "your sales data exactly.")
+            else:
+                st.info("No baseline forecast to compare against yet — upload more sales history first.")
+
+        st.markdown("**Manage events**")
+        st.caption("**Stop applying** ends an event going forward but keeps it in the record, so past "
+                   "forecasts and accuracy stay exactly as they were reported at the time. **Delete** "
+                   "erases it completely and will retroactively change past forecast numbers — use it "
+                   "only for something logged in error.")
+
+        def _ev_label(r):
+            _st = "" if int(r.get("active", 1)) == 1 else "  [inactive]"
+            return (f"#{r['id']} — {r['event_type']} — {r['customer']} — {r['channel']}/{r['product']} "
+                    f"({r['expected_kg_per_month']:+.0f} kg/mo, starts {r['starting_cycle']}){_st}")
+
+        _act = all_events_all[all_events_all["active"] == 1]
+        _inact = all_events_all[all_events_all["active"] == 0]
+
+        if not _act.empty:
+            _al = _act.apply(_ev_label, axis=1).tolist()
+            _am = dict(zip(_al, _act["id"]))
+            _pick_off = st.selectbox("Active events", _al, key="ev_stop_pick")
+            cstop, cdel = st.columns(2)
+            with cstop:
+                if st.button("Stop applying", key="ev_stop"):
+                    conn.execute("UPDATE pipeline_events SET active = 0, deactivated_at = ? WHERE id = ?",
+                                 (datetime.now().strftime("%Y-%m-%d"), int(_am[_pick_off]),))
+                    conn.commit()
+                    reset_all_derived_state()
+                    st.warning("Event stopped — it no longer affects the forecast, but stays in the record.")
+                    st.rerun()
+            with cdel:
+                if st.button("Delete permanently", key="ev_del"):
+                    conn.execute("DELETE FROM pipeline_events WHERE id = ?", (int(_am[_pick_off]),))
+                    conn.commit()
+                    reset_all_derived_state()
+                    st.warning("Deleted. Past forecast numbers that included this event have changed.")
+                    st.rerun()
+
+        if not _inact.empty:
+            _il = _inact.apply(_ev_label, axis=1).tolist()
+            _im = dict(zip(_il, _inact["id"]))
+            _pick_on = st.selectbox("Inactive events", _il, key="ev_on_pick")
+            if st.button("Reactivate this event", key="ev_on"):
+                conn.execute("UPDATE pipeline_events SET active = 1, deactivated_at = NULL WHERE id = ?",
+                             (int(_im[_pick_on]),))
+                conn.commit()
+                reset_all_derived_state()
+                st.success("Event reactivated — it applies to the forecast again.")
+                st.rerun()
+
+        with st.expander("All logged events (all cycles)"):
+            _h = all_events_all.copy()
+            _h["status"] = _h["active"].map({1: "Active", 0: "Inactive"})
+            st.dataframe(_h, use_container_width=True)
+
     st.divider()
     st.subheader("Manual override — replace the number directly")
+    st.caption("Both tools live here: log an **event** above to ADD volume with a reason, or set an "
+               "**override** below to REPLACE a number outright.")
     st.caption(
         "Pipeline events add a reason-backed adjustment on top of the auto forecast. This is different: "
         "it directly replaces the auto+pipeline number for a channel/item with whatever you type — for "
@@ -3524,7 +4038,10 @@ with tab_forecast:
                                         if _has_cust else "This data source doesn't include customer identity.",
                                         disabled=not _has_cust)
         with oc2:
-            ov_kg = st.number_input("Override forecast (kg)", min_value=0.0, step=10.0)
+            # no min_value: a negative override is legitimate (e.g. modelling a return or a
+            # correction), and blocking it silently forced people to work around the tool
+            ov_kg = st.number_input("Override forecast (kg)", step=10.0, value=0.0,
+                                     help="The number this scope should forecast at. Negative is allowed.")
             ov_by = st.text_input("Your name")
         ov_period = st.radio(
             "How long should this apply?",
@@ -3653,414 +4170,6 @@ with tab_forecast:
                     st.rerun()
 
 # --- TAB: Sales plan (S&OP) ---
-with tab_salesplan:
-    st.subheader("Sales plan — the top-down half of the S&OP bridge")
-    st.caption(
-        "This is Sales' own forward-looking plan — entered by month, channel, and item — translated "
-        "into kg using the same price/kg rates used everywhere else in this app. It's compared against "
-        "the app's own demand-sensing forecast below, so a gap between 'what Sales planned' and "
-        "'what's actually happening' is visible early, not discovered at year-end."
-    )
-
-    plan_year = st.text_input("Plan year", value=str(date.today().year), key="plan_year")
-
-    st.markdown("### Upload a plan (bulk)")
-    plan_layout = st.radio(
-        "How is your plan laid out?",
-        ["Wide — months across the top (our standard template)", "Long — one row per channel/month"],
-        help="The company revenue template has channels down the side and one column per month. "
-             "Pick 'Wide' for that; the app will unpivot it for you.")
-    plan_file = st.file_uploader("CSV or Excel", type=["csv", "xlsx", "xls"], key="plan_upload")
-
-    if plan_file is not None and plan_layout.startswith("Wide"):
-        _raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
-        st.dataframe(_raw.head(8), use_container_width=True)
-        _label_col = st.selectbox("Which column holds the channel names?", list(_raw.columns), key="wide_label")
-        # month columns are the ones that parse as real dates -- the template uses actual
-        # datetime headers, so this identifies them without asking the user to list them
-        _month_cols = [col for col in _raw.columns
-                       if isinstance(col, (datetime, pd.Timestamp))]
-        if not _month_cols:
-            st.warning("No date-style column headers found. If your months are text (e.g. 'Jan 2026'), "
-                       "use the 'Long' layout instead, or reformat the headers as dates.")
-        else:
-            st.caption(f"Found {len(_month_cols)} month columns: "
-                       f"{pd.Timestamp(_month_cols[0]).strftime('%b %Y')} to "
-                       f"{pd.Timestamp(_month_cols[-1]).strftime('%b %Y')}")
-            _unit = st.radio("These values are:", ["Revenue ($)", "Volume (kg)"], horizontal=True, key="wide_unit")
-            _year = st.number_input("Plan year", min_value=2000, max_value=2100,
-                                     value=int(pd.Timestamp(_month_cols[0]).year), key="wide_year")
-            if st.button("Import this plan", type="primary"):
-                # built row by row rather than with melt: the template can contain duplicate
-                # or unnamed column headers, and melt fails on those with an unhelpful
-                # internal pandas error. This is slower but predictable.
-                _records = []
-                for _pos, _mc in enumerate(_month_cols):
-                    _col_idx = list(_raw.columns).index(_mc) if list(_raw.columns).count(_mc) == 1 else None
-                    _series = _raw.iloc[:, _col_idx] if _col_idx is not None else _raw[_mc].iloc[:, 0]
-                    for _ri, _val in enumerate(_series):
-                        _num = pd.to_numeric(_val, errors="coerce")
-                        if pd.isna(_num):
-                            continue
-                        _records.append({
-                            _label_col: _raw[_label_col].iloc[_ri] if _label_col in _raw.columns else None,
-                            "month_dt": _mc,
-                            "value": float(_num),
-                        })
-                _long = pd.DataFrame(_records)
-                if not _long.empty:
-                    _long = _long.dropna(subset=[_label_col])
-                if _long.empty:
-                    st.warning("No numeric values found in those month columns — the sheet may still be "
-                               "an empty template.")
-                else:
-                    _long["month"] = pd.to_datetime(_long["month_dt"]).dt.month
-                    _long["channel"] = _long[_label_col].astype(str).str.strip()
-                    _long["product"] = "(all)"
-                    _long["value"] = pd.to_numeric(_long["value"], errors="coerce")
-                    rows_written = 0
-                    for _, r in _long.iterrows():
-                        _kg = _rev = None
-                        if _unit.startswith("Revenue"):
-                            _rev = float(r["value"])
-                        else:
-                            _kg = float(r["value"])
-                        conn.execute("""INSERT INTO sales_plan
-                            (plan_year, month, channel, product, planned_kg, planned_revenue, submitted_by, timestamp)
-                            VALUES (?,?,?,?,?,?,?,?)""",
-                            (int(_year), int(r["month"]), r["channel"], r["product"],
-                             _kg, _rev, "wide import", datetime.now().isoformat()))
-                        rows_written += 1
-                    conn.commit()
-                    st.success(f"Imported {rows_written} plan rows from the wide template.")
-                    st.rerun()
-        plan_file = None  # handled above; skip the long-format path below
-
-    if plan_file is not None:
-        plan_raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
-        st.dataframe(plan_raw.head(), use_container_width=True)
-        pcols = list(plan_raw.columns)
-        pc1, pc2, pc3 = st.columns(3)
-        with pc1:
-            plan_channel_col = st.selectbox("Channel column", pcols, key="plan_channel_col")
-            plan_month_col = st.selectbox("Month column", pcols, key="plan_month_col")
-        with pc2:
-            plan_product_col = st.selectbox("Item column", pcols, key="plan_product_col")
-            plan_amount_col = st.selectbox("Planned amount column", pcols, key="plan_amount_col")
-        with pc3:
-            plan_amount_type = st.radio("This amount is in", ["Dollars ($)", "Kilograms (kg)"], key="plan_amount_type")
-
-        if st.button("Save this plan", type="primary"):
-            std_plan = pd.DataFrame()
-            std_plan["channel"] = plan_raw[plan_channel_col].astype(str)
-            std_plan["product"] = plan_raw[plan_product_col].astype(str)
-            std_plan["month"] = plan_raw[plan_month_col].astype(str)
-            if plan_amount_type == "Dollars ($)":
-                std_plan["planned_dollars"] = pd.to_numeric(plan_raw[plan_amount_col], errors="coerce")
-                std_plan["planned_kg"] = np.nan
-            else:
-                std_plan["planned_kg"] = pd.to_numeric(plan_raw[plan_amount_col], errors="coerce")
-                std_plan["planned_dollars"] = np.nan
-            std_plan = std_plan.dropna(subset=["channel", "product", "month"])
-
-            if not price_df.empty:
-                rate_lookup = price_df.groupby(["channel", "product"], as_index=False)["price_per_kg"].mean()
-                std_plan = std_plan.merge(rate_lookup, on=["channel", "product"], how="left")
-                std_plan["planned_kg"] = np.where(
-                    std_plan["planned_kg"].isna() & std_plan["planned_dollars"].notna() & std_plan["price_per_kg"].notna(),
-                    std_plan["planned_dollars"] / std_plan["price_per_kg"], std_plan["planned_kg"])
-                std_plan = std_plan.drop(columns=["price_per_kg"])
-
-            std_plan["plan_year"] = plan_year
-            std_plan["updated_at"] = datetime.now().isoformat()
-            std_plan["updated_by"] = ""
-            std_plan["note"] = ""
-            insert_dataframe("sales_plan", std_plan)
-            st.success(f"Saved {len(std_plan)} plan rows for {plan_year}.")
-            st.rerun()
-
-    st.divider()
-    st.markdown("### Edit the current plan")
-    st.caption("Add, edit, or delete rows directly — this is how Sales keeps the plan updated over time.")
-    existing_plan = pd.read_sql("SELECT * FROM sales_plan WHERE plan_year = ? ORDER BY month, channel, product",
-                                 conn, params=(plan_year,))
-    edit_base = existing_plan[["channel", "product", "month", "planned_dollars", "planned_kg", "note"]] \
-        if not existing_plan.empty else pd.DataFrame(columns=["channel", "product", "month", "planned_dollars", "planned_kg", "note"])
-
-    edited = st.data_editor(edit_base, num_rows="dynamic", use_container_width=True, key="plan_editor")
-    updated_by = st.text_input("Your name (for the record)", key="plan_updated_by_input")
-
-    if st.button("Save changes to plan", type="primary"):
-        edited_clean = edited.dropna(subset=["channel", "product", "month"], how="any").copy()
-        if not edited_clean.empty and not price_df.empty:
-            rate_lookup = price_df.groupby(["channel", "product"], as_index=False)["price_per_kg"].mean()
-            edited_clean = edited_clean.merge(rate_lookup, on=["channel", "product"], how="left")
-            edited_clean["planned_kg"] = np.where(
-                edited_clean["planned_kg"].isna() & edited_clean["planned_dollars"].notna() & edited_clean["price_per_kg"].notna(),
-                edited_clean["planned_dollars"] / edited_clean["price_per_kg"], edited_clean["planned_kg"])
-            edited_clean = edited_clean.drop(columns=["price_per_kg"])
-        edited_clean["plan_year"] = plan_year
-        edited_clean["updated_at"] = datetime.now().isoformat()
-        edited_clean["updated_by"] = updated_by
-
-        conn.execute("DELETE FROM sales_plan WHERE plan_year = ?", (plan_year,))
-        conn.commit()
-        if not edited_clean.empty:
-            insert_dataframe("sales_plan", edited_clean)
-        st.success(f"Plan for {plan_year} updated ({len(edited_clean)} rows).")
-        st.rerun()
-
-    st.divider()
-    st.markdown("## Reconciliation — plan vs. reality")
-    st.caption(
-        "For months that already happened, this compares the plan to real actuals. For months still "
-        "ahead, it compares the plan to the app's own demand-sensing projection — which gets less "
-        "certain the further out it looks, unlike the plan (which usually assumes similar confidence "
-        "across the whole year). Treat far-future gaps as a rough signal, not a precise miss."
-    )
-
-    plan_monthly = existing_plan.groupby("month", as_index=False)["planned_kg"].sum() if not existing_plan.empty else pd.DataFrame()
-
-    if plan_monthly.empty:
-        st.info("Enter a plan above to see the reconciliation view.")
-    elif not has_data:
-        st.info("Upload sales history in tab 1 to compare the plan against.")
-    else:
-        actuals_monthly = sales_df.copy()
-        actuals_monthly["record_date"] = pd.to_datetime(actuals_monthly["record_date"], errors="coerce")
-        actuals_monthly["month"] = actuals_monthly["record_date"].dt.to_period("M").astype(str)
-        actuals_monthly = actuals_monthly.groupby("month", as_index=False)["kg"].sum().rename(columns={"kg": "actual_kg"})
-
-        recon = plan_monthly.merge(actuals_monthly, on="month", how="left").sort_values("month")
-        missing_months = recon[recon["actual_kg"].isna()]["month"].tolist()
-
-        recon["demand_sensing_kg"] = np.nan
-        if missing_months:
-            company_monthly = sales_df.copy()
-            company_monthly["record_date"] = pd.to_datetime(company_monthly["record_date"], errors="coerce")
-            company_monthly["month"] = company_monthly["record_date"].dt.to_period("M").astype(str)
-            company_monthly_agg = company_monthly.groupby("month", as_index=False)["kg"].sum().sort_values("month")
-            if len(company_monthly_agg) >= 2:
-                with st.spinner("Computing demand-sensing projection for remaining months..."):
-                    proj_recon = project_forward_with_range(company_monthly_agg["kg"].tolist(), None,
-                                                              n_periods=min(len(missing_months) + 3, 12),
-                                                              keep_trend=True)
-                # apply events + overrides here too, so plan-vs-reality compares the plan
-                # against the SAME forward number the rest of the app shows -- otherwise a
-                # signed contract would look like a plan gap rather than expected volume
-                _monthly_adj = 0.0
-                if type_level_forecasts:
-                    for _lab, _base in type_level_forecasts.items():
-                        _monthly_adj += (type_level_forecasts_with_pipeline.get(_lab, _base) - _base)
-                _monthly_adj *= 4.345
-                if abs(_monthly_adj) > 0.5:
-                    proj_recon = proj_recon.copy()
-                    proj_recon["forecast_kg"] = (proj_recon["forecast_kg"] + _monthly_adj).clip(lower=0)
-                    st.caption(f"Projection includes logged events and overrides ({_monthly_adj:+,.0f} kg/mo).")
-                last_month = pd.Period(company_monthly_agg["month"].iloc[-1], freq="M")
-                proj_months = [(last_month + i + 1).strftime("%Y-%m") for i in range(len(proj_recon))]
-                proj_lookup = dict(zip(proj_months, proj_recon["forecast_kg"]))
-                recon["demand_sensing_kg"] = recon["month"].map(proj_lookup)
-
-        recon["Status"] = np.where(recon["actual_kg"].notna(), "Actual", "Forecast (projected)")
-        recon["Reality (kg)"] = recon["actual_kg"].fillna(recon["demand_sensing_kg"])
-        recon["Gap vs plan (kg)"] = recon["Reality (kg)"] - recon["planned_kg"]
-        recon["Gap %"] = np.where(recon["planned_kg"] != 0, recon["Gap vs plan (kg)"] / recon["planned_kg"] * 100, np.nan)
-
-        display_recon = recon.rename(columns={"month": "Month", "planned_kg": "Plan (kg)"})[
-            ["Month", "Plan (kg)", "Reality (kg)", "Gap vs plan (kg)", "Gap %", "Status"]].round(1)
-        st.dataframe(display_recon, use_container_width=True, hide_index=True)
-
-        fig_recon = go.Figure()
-        fig_recon.add_trace(go.Scatter(x=recon["month"], y=recon["planned_kg"], mode="lines+markers",
-                                        name="Sales plan", line=dict(color="rgb(217,119,6)", width=2)))
-        fig_recon.add_trace(go.Scatter(x=recon["month"], y=recon["Reality (kg)"], mode="lines+markers",
-                                        name="Actual / demand-sensing", line=dict(color="rgb(31,119,180)", width=2)))
-        fig_recon.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
-                                 yaxis_title="kg", hovermode="x unified")
-        st.plotly_chart(fig_recon, use_container_width=True)
-
-# --- TAB: Pipeline / known events ---
-with tab_pipeline:
-    st.subheader("Log what's happening right now — before it shows up in sales data")
-    st.caption(
-        "Signed a new contract? Lost an account? Know volume is about to change? Log it here. "
-        "A trend forecast can't see a deal that hasn't shipped yet — but you already know about it. "
-        "Once logged, it adjusts the forecast automatically, on top of the auto-generated baseline."
-    )
-
-    with st.form("pipeline_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            event_type = st.selectbox("What happened", [
-                "New contract signed", "Account lost / churned", "Expected volume change", "Other"])
-            customer = st.text_input("Customer / account name")
-            channel = st.selectbox("Channel", sorted(sales_df["channel"].unique().tolist())
-                                    if has_data else ["Wholesale", "Retail"])
-            product = st.selectbox("Product", sorted(sales_df["product"].unique().tolist())
-                                    if has_data else ["Product"])
-        with c2:
-            rate_unit = st.radio(
-                "How is this volume expressed?", ["Per month", "Per week"], horizontal=True,
-                help="A new account quoted as 'X kg a month' vs 'X kg a week' are very different "
-                     "amounts — pick whichever way you were told it, and the app converts.")
-            expected_kg_raw = st.number_input(
-                "Expected kg impact", step=1.0,
-                help="Positive for new/growing business, negative for a lost account.")
-            start_date = st.date_input(
-                "Starts on", value=datetime.now().date(),
-                help="The date this actually begins — e.g. the day a new account's first order "
-                     "ships. The event counts from this date forward; it won't affect any week "
-                     "before it.")
-            # stored as the month label the rest of the app already keys on, so the date is a
-            # friendlier way to say the same thing rather than a schema change
-            starting_cycle = start_date.strftime("%Y-%m")
-            ongoing = st.checkbox("Ongoing (keeps applying to future cycles)", value=True,
-                                   help="Uncheck for a one-time event that only affects this one cycle.")
-            submitted_by = st.text_input("Logged by")
-        note = st.text_area("Note (context for whoever reads this later)")
-
-        if st.form_submit_button("Log this event", type="primary"):
-            # store everything as a monthly figure regardless of how it was entered, so there
-            # is exactly one unit in the database and no ambiguity downstream
-            expected_kg = expected_kg_raw * 4.345 if rate_unit == "Per week" else expected_kg_raw
-            conn.execute("""INSERT INTO pipeline_events
-                (timestamp, submitted_by, event_type, customer, channel, product,
-                 expected_kg_per_month, starting_cycle, ongoing, note)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (datetime.now().isoformat(), submitted_by, event_type, customer, channel, product,
-                 expected_kg, starting_cycle, int(ongoing), note))
-            conn.commit()
-            st.success("Logged — the forecast now includes this.")
-            st.rerun()
-
-    st.divider()
-    if all_events_all.empty:
-        st.info("No events logged yet.")
-    else:
-        st.markdown(f"**Currently applying to cycle {cycle}:**")
-        if applicable.empty:
-            st.caption("None of the logged events apply to this cycle yet.")
-        else:
-            st.dataframe(
-                applicable[["event_type", "customer", "channel", "product",
-                            "expected_kg_per_month", "starting_cycle", "ongoing", "note"]],
-                use_container_width=True)
-            total_pipeline_kg = applicable["expected_kg_per_month"].sum()
-            st.metric("Total pipeline adjustment this cycle", f"{total_pipeline_kg:+,.0f} kg")
-
-            # An event is a stand-in for volume the model can't see YET. Once real sales for
-            # that scope start arriving, the model learns the new level on its own -- and
-            # leaving the event on then double-counts it. This flags when that's happened so
-            # you know it's safe to turn off, rather than having to remember.
-            if has_data and not weekly_actual.empty:
-                _ready = []
-                for _, ev in applicable.iterrows():
-                    _scope = weekly_actual.copy()
-                    for dim in ("channel", "product"):
-                        if dim in ev and pd.notna(ev.get(dim)) and str(ev[dim]) not in ("", "(all)"):
-                            _scope = _scope[_scope[dim] == ev[dim]]
-                    if _scope.empty:
-                        continue
-                    _start_month = str(ev.get("starting_cycle", ""))
-                    _after = _scope[_scope["week_start"].astype(str) >= f"{_start_month}-01"]
-                    _weeks_of_actuals = _after["week_start"].nunique()
-                    if _weeks_of_actuals >= 4:
-                        _expected_weekly = float(ev["expected_kg_per_month"]) / 4.345
-                        _before = _scope[_scope["week_start"].astype(str) < f"{_start_month}-01"]
-                        if _before.empty:
-                            continue
-                        _base = _before.groupby("week_start")["actual_kg"].sum().tail(8).mean()
-                        _now = _after.groupby("week_start")["actual_kg"].sum().mean()
-                        _observed_lift = _now - _base
-                        # has the real lift caught up to at least half what the event predicted?
-                        if _expected_weekly != 0 and _observed_lift / _expected_weekly >= 0.5:
-                            _ready.append({
-                                "Event": f"{ev.get('customer') or ''} {ev.get('channel') or ''} "
-                                         f"{ev.get('product') or ''}".strip(),
-                                "Weeks of real data since start": _weeks_of_actuals,
-                                "Event predicted (kg/wk)": round(_expected_weekly, 1),
-                                "Actually observed (kg/wk)": round(_observed_lift, 1),
-                            })
-                if _ready:
-                    st.warning(f"{len(_ready)} event(s) now show up in real sales data. The forecast has "
-                               "learned this volume on its own, so leaving the event on double-counts it "
-                               "— worth turning these off.")
-                    st.dataframe(pd.DataFrame(_ready), use_container_width=True, hide_index=True)
-
-            st.markdown("**Is this actually changing the forecast? Here's the before/after.**")
-            if not live_forecast.empty:
-                impact = live_forecast[["channel", "product", "forecast_kg"]].rename(
-                    columns={"forecast_kg": "Baseline forecast (kg) — trend only, no events"})
-                impact = impact.merge(pipeline_by_cp, on=["channel", "product"], how="inner")
-                if impact.empty:
-                    st.warning("None of the logged events match a channel/product the trend model currently "
-                               "has a forecast for — double check the Channel and Product you selected when "
-                               "logging the event match what's actually in your uploaded sales data.")
-                else:
-                    impact["Adjusted forecast (kg) — with events"] = (
-                        impact["Baseline forecast (kg) — trend only, no events"] + impact["pipeline_kg"])
-                    impact = impact.rename(columns={"channel": "Channel", "product": "Item",
-                                                     "pipeline_kg": "Event adjustment (kg)"})
-                    st.dataframe(impact[["Channel", "Item", "Baseline forecast (kg) — trend only, no events",
-                                          "Event adjustment (kg)", "Adjusted forecast (kg) — with events"]],
-                                 use_container_width=True)
-                    st.caption("If the baseline and adjusted columns are identical, the event isn't actually "
-                               "reaching this channel/product — check the Channel/Product spelling matches "
-                               "your sales data exactly.")
-            else:
-                st.info("No baseline forecast to compare against yet — upload more sales history first.")
-
-        st.markdown("**Manage events**")
-        st.caption("**Stop applying** ends an event going forward but keeps it in the record, so past "
-                   "forecasts and accuracy stay exactly as they were reported at the time. **Delete** "
-                   "erases it completely and will retroactively change past forecast numbers — use it "
-                   "only for something logged in error.")
-
-        def _ev_label(r):
-            _st = "" if int(r.get("active", 1)) == 1 else "  [inactive]"
-            return (f"#{r['id']} — {r['event_type']} — {r['customer']} — {r['channel']}/{r['product']} "
-                    f"({r['expected_kg_per_month']:+.0f} kg/mo, starts {r['starting_cycle']}){_st}")
-
-        _act = all_events_all[all_events_all["active"] == 1]
-        _inact = all_events_all[all_events_all["active"] == 0]
-
-        if not _act.empty:
-            _al = _act.apply(_ev_label, axis=1).tolist()
-            _am = dict(zip(_al, _act["id"]))
-            _pick_off = st.selectbox("Active events", _al, key="ev_stop_pick")
-            cstop, cdel = st.columns(2)
-            with cstop:
-                if st.button("Stop applying", key="ev_stop"):
-                    conn.execute("UPDATE pipeline_events SET active = 0 WHERE id = ?", (int(_am[_pick_off]),))
-                    conn.commit()
-                    reset_all_derived_state()
-                    st.warning("Event stopped — it no longer affects the forecast, but stays in the record.")
-                    st.rerun()
-            with cdel:
-                if st.button("Delete permanently", key="ev_del"):
-                    conn.execute("DELETE FROM pipeline_events WHERE id = ?", (int(_am[_pick_off]),))
-                    conn.commit()
-                    reset_all_derived_state()
-                    st.warning("Deleted. Past forecast numbers that included this event have changed.")
-                    st.rerun()
-
-        if not _inact.empty:
-            _il = _inact.apply(_ev_label, axis=1).tolist()
-            _im = dict(zip(_il, _inact["id"]))
-            _pick_on = st.selectbox("Inactive events", _il, key="ev_on_pick")
-            if st.button("Reactivate this event", key="ev_on"):
-                conn.execute("UPDATE pipeline_events SET active = 1 WHERE id = ?", (int(_im[_pick_on]),))
-                conn.commit()
-                reset_all_derived_state()
-                st.success("Event reactivated — it applies to the forecast again.")
-                st.rerun()
-
-        with st.expander("All logged events (all cycles)"):
-            _h = all_events_all.copy()
-            _h["status"] = _h["active"].map({1: "Active", 0: "Inactive"})
-            st.dataframe(_h, use_container_width=True)
-
 # --- TAB: Ops capacity check ---
 with tab_ops:
     st.subheader("Operations: enter capacity and check against the plan")

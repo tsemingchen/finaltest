@@ -154,7 +154,8 @@ def get_conn():
         {id_col},
         timestamp TEXT, submitted_by TEXT,
         event_type TEXT, customer TEXT, channel TEXT, product TEXT,
-        expected_kg_per_month REAL, starting_cycle TEXT, ongoing INTEGER, note TEXT
+        expected_kg_per_month REAL, starting_cycle TEXT, ongoing INTEGER, note TEXT,
+        active INTEGER DEFAULT 1
     )""")
     conn.execute(f"""CREATE TABLE IF NOT EXISTS manual_overrides (
         {id_col},
@@ -206,6 +207,14 @@ def get_conn():
     # migration: manual_overrides predates customer-level and wildcard overrides
     try:
         conn.execute("ALTER TABLE manual_overrides ADD COLUMN IF NOT EXISTS customer TEXT")
+        conn.commit()
+    except Exception:
+        conn.commit()
+    # migration: events predate the active flag. Existing rows default to active so nothing
+    # silently stops applying when this ships.
+    try:
+        conn.execute("ALTER TABLE pipeline_events ADD COLUMN IF NOT EXISTS active INTEGER DEFAULT 1")
+        conn.execute("UPDATE pipeline_events SET active = 1 WHERE active IS NULL")
         conn.commit()
     except Exception:
         conn.commit()
@@ -1724,7 +1733,14 @@ if not live_forecast.empty:
         subset=["channel", "product", "target_week"], keep="last")
 
 # --- pipeline events, layered on top of the live forecast ---
-all_events = pd.read_sql("SELECT * FROM pipeline_events ORDER BY id DESC", conn)
+all_events_all = pd.read_sql("SELECT * FROM pipeline_events ORDER BY id DESC", conn)
+if "active" not in all_events_all.columns:
+    all_events_all["active"] = 1
+all_events_all["active"] = all_events_all["active"].fillna(1).astype(int)
+# only ACTIVE events shape any forecast. Inactive ones stay in the database so the historical
+# record of what was predicted at the time survives -- deleting them outright would silently
+# rewrite past forecast numbers and past accuracy, which makes the accuracy story untrustworthy.
+all_events = all_events_all[all_events_all["active"] == 1]
 if not all_events.empty:
     applicable = all_events[
         (all_events["starting_cycle"] <= cycle) &
@@ -2536,6 +2552,10 @@ with tab_dash:
 
                 shares["Segment"] = shares[group_cols].astype(str).agg(" — ".join, axis=1) \
                     if len(group_cols) > 1 else shares[group_cols[0]]
+                # hand the on-screen breakdown to the report builder, so the exported report
+                # shows the same slice the user is actually looking at rather than a fixed view
+                st.session_state["_report_breakdown"] = shares[["Segment", "forecast_kg"]].copy()
+                st.session_state["_report_breakdown_label"] = " / ".join(group_cols)
                 period_label = {"Next week": "Forecast kg (next week)", "Next month": "Forecast kg (next month)",
                                  "Next year": "Forecast kg (next year, extrapolated)"}[horizon]
 
@@ -2774,15 +2794,35 @@ with tab_dash:
                                      xaxis_title="Week", yaxis_title="Total actual kg")
             trend_chart_html = trend_fig.to_html(include_plotlyjs="cdn", full_html=False)
 
+            # overlay the backtested forecast line, exactly as the Overview chart shows it,
+            # so the report is the same picture rather than a different-looking summary
+            try:
+                _rep_bt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
+                if not _rep_bt.empty:
+                    _rep_adj = event_adjustment_by_period(all_events, _rep_bt["period"].tolist(), freq="W")
+                    _rep_bt = _rep_bt.copy()
+                    _rep_bt["forecast_kg"] = _rep_bt["forecast_kg"] + _rep_bt["period"].map(_rep_adj).fillna(0)
+                    trend_fig.add_trace(go.Scatter(
+                        x=_rep_bt["period"], y=_rep_bt["forecast_kg"], mode="lines",
+                        name="Auto forecast (backtested)", line=dict(color="#8b5a3c", dash="dash")))
+                    trend_fig.update_layout(showlegend=True, legend=dict(
+                        orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+                    trend_chart_html = trend_fig.to_html(include_plotlyjs="cdn", full_html=False)
+            except Exception:
+                pass  # report should still generate if the backtest can't be computed
+
+            # the breakdown exactly as it's filtered on screen, not a fixed top-15 bar chart
             bar_chart_html = ""
-            if not report_bar_df.empty:
-                bar_sorted = report_bar_df.sort_values("forecast_kg", ascending=True).tail(15)
-                bar_fig = go.Figure(go.Bar(x=bar_sorted["forecast_kg"],
-                                            y=bar_sorted["channel"] + " — " + bar_sorted["product"],
-                                            orientation="h", marker_color="rgb(139,90,60)"))
-                bar_fig.update_layout(height=max(280, 24 * len(bar_sorted)), margin=dict(l=10, r=10, t=10, b=10),
-                                       xaxis_title="Forecast kg")
+            _bd = st.session_state.get("_report_breakdown")
+            if _bd is not None and not _bd.empty:
+                bar_sorted = _bd.sort_values("forecast_kg", ascending=True).tail(15)
+                bar_fig = go.Figure(go.Bar(x=bar_sorted["forecast_kg"], y=bar_sorted["Segment"].astype(str),
+                                            orientation="h", marker_color="#2F6F6B"))
+                bar_fig.update_layout(height=max(280, 26 * len(bar_sorted)),
+                                       margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Forecast kg")
                 bar_chart_html = bar_fig.to_html(include_plotlyjs=False, full_html=False)
+                bar_chart_html += _bd[["Segment", "forecast_kg"]].rename(
+                    columns={"forecast_kg": "Forecast kg"}).to_html(index=False, border=0)
 
             return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>Demand Planning Report — {cycle}</title>
@@ -2798,8 +2838,8 @@ th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
 {cap_html}
 <h2>Overall trend — actual sales</h2>
 {trend_chart_html}
-<h2>Forecast by segment</h2>
-{bar_chart_html if bar_chart_html else "<p>No forecast available yet.</p>"}
+<h2>Forecast breakdown — by {st.session_state.get("_report_breakdown_label", "segment")}</h2>
+{bar_chart_html if bar_chart_html else "<p>Open the Dashboard breakdown first, then generate the report.</p>"}
 <p class="meta">Generated automatically from 49th Parallel's demand planning app.</p>
 </body></html>"""
 
@@ -3895,7 +3935,7 @@ with tab_pipeline:
             st.rerun()
 
     st.divider()
-    if all_events.empty:
+    if all_events_all.empty:
         st.info("No events logged yet.")
     else:
         st.markdown(f"**Currently applying to cycle {cycle}:**")
@@ -3971,20 +4011,55 @@ with tab_pipeline:
             else:
                 st.info("No baseline forecast to compare against yet — upload more sales history first.")
 
-        st.markdown("**Delete an event** (e.g. a contract that got cancelled)")
-        event_labels = all_events.apply(
-            lambda r: f"#{r['id']} — {r['event_type']} — {r['customer']} — {r['channel']}/{r['product']} "
-                      f"({r['expected_kg_per_month']:+.0f} kg/mo, starts {r['starting_cycle']})", axis=1)
-        event_map = dict(zip(event_labels, all_events["id"]))
-        to_delete_label = st.selectbox("Choose an event", event_labels.tolist())
-        if st.button("Delete this event"):
-            conn.execute("DELETE FROM pipeline_events WHERE id = ?", (int(event_map[to_delete_label]),))
-            conn.commit()
-            st.warning("Deleted — the forecast updates immediately.")
-            st.rerun()
+        st.markdown("**Manage events**")
+        st.caption("**Stop applying** ends an event going forward but keeps it in the record, so past "
+                   "forecasts and accuracy stay exactly as they were reported at the time. **Delete** "
+                   "erases it completely and will retroactively change past forecast numbers — use it "
+                   "only for something logged in error.")
+
+        def _ev_label(r):
+            _st = "" if int(r.get("active", 1)) == 1 else "  [inactive]"
+            return (f"#{r['id']} — {r['event_type']} — {r['customer']} — {r['channel']}/{r['product']} "
+                    f"({r['expected_kg_per_month']:+.0f} kg/mo, starts {r['starting_cycle']}){_st}")
+
+        _act = all_events_all[all_events_all["active"] == 1]
+        _inact = all_events_all[all_events_all["active"] == 0]
+
+        if not _act.empty:
+            _al = _act.apply(_ev_label, axis=1).tolist()
+            _am = dict(zip(_al, _act["id"]))
+            _pick_off = st.selectbox("Active events", _al, key="ev_stop_pick")
+            cstop, cdel = st.columns(2)
+            with cstop:
+                if st.button("Stop applying", key="ev_stop"):
+                    conn.execute("UPDATE pipeline_events SET active = 0 WHERE id = ?", (int(_am[_pick_off]),))
+                    conn.commit()
+                    reset_all_derived_state()
+                    st.warning("Event stopped — it no longer affects the forecast, but stays in the record.")
+                    st.rerun()
+            with cdel:
+                if st.button("Delete permanently", key="ev_del"):
+                    conn.execute("DELETE FROM pipeline_events WHERE id = ?", (int(_am[_pick_off]),))
+                    conn.commit()
+                    reset_all_derived_state()
+                    st.warning("Deleted. Past forecast numbers that included this event have changed.")
+                    st.rerun()
+
+        if not _inact.empty:
+            _il = _inact.apply(_ev_label, axis=1).tolist()
+            _im = dict(zip(_il, _inact["id"]))
+            _pick_on = st.selectbox("Inactive events", _il, key="ev_on_pick")
+            if st.button("Reactivate this event", key="ev_on"):
+                conn.execute("UPDATE pipeline_events SET active = 1 WHERE id = ?", (int(_im[_pick_on]),))
+                conn.commit()
+                reset_all_derived_state()
+                st.success("Event reactivated — it applies to the forecast again.")
+                st.rerun()
 
         with st.expander("All logged events (all cycles)"):
-            st.dataframe(all_events, use_container_width=True)
+            _h = all_events_all.copy()
+            _h["status"] = _h["active"].map({1: "Active", 0: "Inactive"})
+            st.dataframe(_h, use_container_width=True)
 
 # --- TAB: Ops capacity check ---
 with tab_ops:
@@ -4180,7 +4255,9 @@ with tab_history:
         af_full = pd.read_sql("SELECT * FROM auto_forecasts ORDER BY id DESC", conn)
         st.download_button("Download auto_forecasts.csv", af_full.to_csv(index=False), "auto_forecasts.csv")
     st.markdown("**Pipeline events**")
-    st.dataframe(all_events, use_container_width=True)
+    _hh = all_events_all.copy()
+    _hh["status"] = _hh["active"].map({1: "Active", 0: "Inactive"})
+    st.dataframe(_hh, use_container_width=True)
     st.markdown("**Sign-offs**")
     st.dataframe(pd.read_sql("SELECT * FROM signoffs ORDER BY id DESC", conn), use_container_width=True)
     st.caption("Download buttons above back up all data as CSV — recommended periodically, "

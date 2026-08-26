@@ -1927,17 +1927,76 @@ if not translated.empty and not price_df.empty:
 
     # cascading fallback: exact size rate -> that item's average rate -> that channel's
     # average -> company-wide average. Valuing volume at zero is never the right answer.
-    _item_rate = price_df.groupby(["channel", "product"], as_index=False)["price_per_kg"].mean() \
-        .rename(columns={"price_per_kg": "_item_rate"})
-    _chan_rate = price_df.groupby("channel", as_index=False)["price_per_kg"].mean() \
-        .rename(columns={"price_per_kg": "_chan_rate"})
-    _global_rate = float(price_df["price_per_kg"].mean()) if not price_df.empty else np.nan
+    # Every fallback rate is VOLUME-WEIGHTED, not a plain mean. A plain average treats a
+    # customer buying 5 kg the same as one buying 5,000 kg, which misprices the forecast
+    # whenever the mix is uneven -- and it always is. Weighting by real kg makes the fallback
+    # reflect what the business actually sells.
+    if {"total_kg", "total_revenue"}.issubset(price_df.columns):
+        _w = price_df.copy()
+    else:
+        # reconstruct volume weights from the source data when price_df doesn't carry them
+        _wsrc = sales_df.copy()
+        _wsrc["record_date"] = pd.to_datetime(_wsrc["record_date"], errors="coerce")
+        _cut = _wsrc["record_date"].max() - pd.Timedelta(days=45)
+        _recent = _wsrc[_wsrc["record_date"] >= _cut]
+        _wsrc = _recent if len(_recent) >= 20 else _wsrc
+        _w = _wsrc.groupby(["channel", "product", "size_label"], as_index=False).agg(
+            total_kg=("kg", "sum"), total_revenue=("revenue", "sum"))
+
+    def _weighted_rate(keys, name):
+        g = _w.groupby(keys, as_index=False).agg(_k=("total_kg", "sum"), _r=("total_revenue", "sum"))
+        g[name] = g["_r"] / g["_k"].replace(0, np.nan)
+        return g[keys + [name]]
+
+    _item_rate = _weighted_rate(["channel", "product"], "_item_rate")
+    _chan_rate = _weighted_rate(["channel"], "_chan_rate")
+    _gk, _gr = float(_w["total_kg"].sum()), float(_w["total_revenue"].sum())
+    _global_rate = (_gr / _gk) if _gk > 0 else np.nan
     dollar_view = dollar_view.merge(_item_rate, on=["channel", "product"], how="left")
     dollar_view = dollar_view.merge(_chan_rate, on="channel", how="left")
     dollar_view["_rate_used"] = (dollar_view["price_per_kg"]
                                  .fillna(dollar_view["_item_rate"])
                                  .fillna(dollar_view["_chan_rate"])
                                  .fillna(_global_rate))
+    # Refine using CUSTOMER-level rates where the data supports it. Different customers pay
+    # genuinely different prices for the same item, so a single channel/item/size rate
+    # misprices the forecast whenever the customer mix is uneven. Rather than pick one
+    # customer's price, blend them by each customer's real share of that item's volume --
+    # so the rate used reflects who is actually buying it.
+    try:
+        _cust_rates = compute_customer_price_per_kg(sales_df)
+        if not _cust_rates.empty and "customer" in sales_df.columns:
+            _cm = sales_df.copy()
+            _cm["record_date"] = pd.to_datetime(_cm["record_date"], errors="coerce")
+            _ccut = _cm["record_date"].max() - pd.Timedelta(days=45)
+            _cr = _cm[_cm["record_date"] >= _ccut]
+            _cm = _cr if len(_cr) >= 20 else _cm
+            _cm = _cm[_cm["customer"] != "(not tracked)"]
+            if not _cm.empty:
+                _mix = _cm.groupby(["channel", "product", "customer"], as_index=False)["kg"].sum()
+                _tot = _mix.groupby(["channel", "product"], as_index=False)["kg"].sum() \
+                    .rename(columns={"kg": "_item_kg"})
+                _mix = _mix.merge(_tot, on=["channel", "product"], how="left")
+                _mix["_share"] = _mix["kg"] / _mix["_item_kg"].replace(0, np.nan)
+                _mix = _mix.merge(
+                    _cust_rates[["channel", "product", "customer", "effective_price_per_kg"]]
+                    if "effective_price_per_kg" in _cust_rates.columns
+                    else _cust_rates[["channel", "product", "customer", "price_per_kg"]].rename(
+                        columns={"price_per_kg": "effective_price_per_kg"}),
+                    on=["channel", "product", "customer"], how="left")
+                _mix = _mix.dropna(subset=["effective_price_per_kg", "_share"])
+                if not _mix.empty:
+                    _blend = _mix.assign(_wp=_mix["effective_price_per_kg"] * _mix["_share"]) \
+                        .groupby(["channel", "product"], as_index=False).agg(
+                            _cust_blend=("_wp", "sum"), _cov=("_share", "sum"))
+                    # only trust the blend where it covers most of that item's volume
+                    _blend = _blend[_blend["_cov"] >= 0.6]
+                    dollar_view = dollar_view.merge(
+                        _blend[["channel", "product", "_cust_blend"]], on=["channel", "product"], how="left")
+                    dollar_view["_rate_used"] = dollar_view["_cust_blend"].fillna(dollar_view["_rate_used"])
+    except Exception:
+        pass  # customer refinement is a bonus; never let it break the dollar figure
+
     _unpriced_kg = float(dollar_view.loc[dollar_view["_rate_used"].isna(), "forecast_kg"].sum())
     dollar_view["forecast_cad"] = (dollar_view["forecast_kg"] * dollar_view["_rate_used"]).round(2)
     dollar_by_cp = dollar_view.groupby(["channel", "product"], as_index=False).agg(

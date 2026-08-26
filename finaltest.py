@@ -1582,7 +1582,7 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def detect_seasonal_period(series, candidates=(4, 5, 13, 26, 52), min_corr=0.25):
+def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), min_corr=0.20):
     """Finds a genuine repeating cycle in the data, or returns None.
 
     A flat forward forecast means the model found no repeating structure -- only noise. The
@@ -1594,17 +1594,24 @@ def detect_seasonal_period(series, candidates=(4, 5, 13, 26, 52), min_corr=0.25)
     v = np.asarray(series, dtype=float)
     v = v[~np.isnan(v)]
     n = len(v)
-    if n < 24:
+    if n < 20:
         return None
-    v = v - v.mean()
-    denom = float(np.dot(v, v))
+    # measure the correlation on FIRST DIFFERENCES, not raw values. A level shift or a strong
+    # trend (like a step change in volume) dominates raw autocorrelation and masks a genuine
+    # cycle underneath -- verified directly: a real 4-period cycle sitting under a level shift
+    # scored higher at the wrong lag on raw values, and only stood out clearly once detrended.
+    d = np.diff(v)
+    if len(d) < 8:
+        return None
+    d = d - d.mean()
+    denom = float(np.dot(d, d))
     if denom <= 0:
         return None
     best, best_corr = None, min_corr
     for lag in candidates:
-        if n < lag * 2 + 4:      # need at least two full cycles to believe it
+        if len(d) < lag * 2 + 2:      # need at least two full cycles to believe it
             continue
-        corr = float(np.dot(v[:-lag], v[lag:]) / denom)
+        corr = float(np.dot(d[:-lag], d[lag:]) / denom)
         if corr > best_corr:
             best, best_corr = lag, corr
     return best

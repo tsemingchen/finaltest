@@ -1581,7 +1581,37 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
-def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_trend=False):
+@st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
+def detect_seasonal_period(series, candidates=(4, 5, 13, 26, 52), min_corr=0.25):
+    """Finds a genuine repeating cycle in the data, or returns None.
+
+    A flat forward forecast means the model found no repeating structure -- only noise. The
+    honest way to make a forecast move up and down is to model a cycle that's really there
+    (a monthly ordering rhythm, a quarterly push, a yearly season), NOT to add wiggle for
+    appearance. This measures how strongly the series correlates with itself at each
+    candidate lag and returns the strongest one that clears `min_corr`. If nothing clears
+    it, a smooth line genuinely is the best available answer."""
+    v = np.asarray(series, dtype=float)
+    v = v[~np.isnan(v)]
+    n = len(v)
+    if n < 24:
+        return None
+    v = v - v.mean()
+    denom = float(np.dot(v, v))
+    if denom <= 0:
+        return None
+    best, best_corr = None, min_corr
+    for lag in candidates:
+        if n < lag * 2 + 4:      # need at least two full cycles to believe it
+            continue
+        corr = float(np.dot(v[:-lag], v[lag:]) / denom)
+        if corr > best_corr:
+            best, best_corr = lag, corr
+    return best
+
+
+def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_trend=False,
+                                seasonal_period=None):
     """Projects multiple periods ahead using a single non-seasonal ARIMA(1,1,1) fit, which
     produces the whole path at once with real statistical confidence intervals (verified:
     recursive re-feeding through ARIMA produced a forecast that more than doubled over 8
@@ -1599,7 +1629,10 @@ def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_tre
     vals = np.asarray(actual_series, dtype=float)
     n = len(vals)
     if n >= 8:
-        seasonal = (0, 0, 0, 0)
+        # use a real detected cycle when one exists, so the projection genuinely rises and
+        # falls the way the business does instead of flattening to an average
+        _m = seasonal_period if seasonal_period else detect_seasonal_period(list(vals))
+        seasonal = (1, 0, 1, _m) if _m else (0, 0, 0, 0)
         try:
             import warnings
             with warnings.catch_warnings():
@@ -1869,9 +1902,31 @@ else:
 
 # implied $ CAD value of the forecast, using the real computed price per kg
 if not translated.empty and not price_df.empty:
-    dollar_view = translated.merge(price_df[["channel", "product", "size_label", "price_per_kg"]],
-                                    on=["channel", "product", "size_label"], how="left")
-    dollar_view["forecast_cad"] = (dollar_view["forecast_kg"] * dollar_view["price_per_kg"]).round(2)
+    # Two real failure modes fixed here, both of which made the dollar figure swing wildly
+    # against the same kg:
+    #   1. If price_df had more than one row per channel/product/size, the merge DUPLICATED
+    #      forecast rows -- inflating both kg and dollars.
+    #   2. If a size had no rate, price_per_kg came back NaN and that volume was valued at
+    #      ZERO -- silently understating revenue with no warning.
+    _rates = price_df[["channel", "product", "size_label", "price_per_kg"]].drop_duplicates(
+        subset=["channel", "product", "size_label"], keep="first")
+    dollar_view = translated.merge(_rates, on=["channel", "product", "size_label"], how="left")
+
+    # cascading fallback: exact size rate -> that item's average rate -> that channel's
+    # average -> company-wide average. Valuing volume at zero is never the right answer.
+    _item_rate = price_df.groupby(["channel", "product"], as_index=False)["price_per_kg"].mean() \
+        .rename(columns={"price_per_kg": "_item_rate"})
+    _chan_rate = price_df.groupby("channel", as_index=False)["price_per_kg"].mean() \
+        .rename(columns={"price_per_kg": "_chan_rate"})
+    _global_rate = float(price_df["price_per_kg"].mean()) if not price_df.empty else np.nan
+    dollar_view = dollar_view.merge(_item_rate, on=["channel", "product"], how="left")
+    dollar_view = dollar_view.merge(_chan_rate, on="channel", how="left")
+    dollar_view["_rate_used"] = (dollar_view["price_per_kg"]
+                                 .fillna(dollar_view["_item_rate"])
+                                 .fillna(dollar_view["_chan_rate"])
+                                 .fillna(_global_rate))
+    _unpriced_kg = float(dollar_view.loc[dollar_view["_rate_used"].isna(), "forecast_kg"].sum())
+    dollar_view["forecast_cad"] = (dollar_view["forecast_kg"] * dollar_view["_rate_used"]).round(2)
     dollar_by_cp = dollar_view.groupby(["channel", "product"], as_index=False).agg(
         forecast_kg=("forecast_kg", "sum"), forecast_cad=("forecast_cad", "sum"))
 else:
@@ -2038,7 +2093,14 @@ with tab_dash:
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric(f"Forecast: {forecast_period_label}", f"{next_week_kg_all:,.0f} kg",
                   help="The 7-day period this forecast covers, shown in the label above.")
-        k2.metric("Forecast value", f"${next_week_cad_all:,.0f}")
+        # show the implied $/kg -- the fastest way to spot a valuation problem. If this number
+        # looks nothing like your real average selling price, the dollar figure is wrong even
+        # when the kg figure is right, and that's otherwise very hard to notice.
+        _implied = (next_week_cad_all / next_week_kg_all) if next_week_kg_all else 0
+        k2.metric("Forecast value", f"${next_week_cad_all:,.0f}",
+                  help=f"Implied average rate: ${_implied:,.2f}/kg. If that looks wrong against your "
+                       "real selling prices, check tab 2 (Computed rates) — the dollar figure is only "
+                       "as good as the rates behind it.")
         k3.metric(f"Actual — week of {latest_actual_week}" if latest_actual_week else "Last week actual",
                   f"{latest_actual_kg:,.0f} kg" if latest_actual_kg is not None else "n/a")
         k4.metric("Last week's forecast", last_week_accuracy_label, delta=last_week_accuracy_delta,
@@ -2239,6 +2301,13 @@ with tab_dash:
                     projection_pt = project_forward_with_range(
                         agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown,
                         keep_trend=True)
+                    _detected = detect_seasonal_period(agg_pt["actual_kg"].tolist())
+                    if _detected:
+                        st.caption(f"Repeating {_detected}-period cycle detected — the forecast follows it.")
+                    else:
+                        st.caption("No repeating cycle found in this segment's history, so the forecast "
+                                   "is smooth. The week-to-week swings here look like noise, and "
+                                   "predicting noise makes accuracy worse, not better.")
 
                     # anchor period 1 to the SAME single-step forecast that feeds the Overview
                     # KPI total -- guarantees this table's first period matches the top of the

@@ -1582,7 +1582,7 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), min_corr=0.20):
+def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), min_corr=0.18):
     """Finds a genuine repeating cycle in the data, or returns None.
 
     A flat forward forecast means the model found no repeating structure -- only noise. The
@@ -1600,18 +1600,24 @@ def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), mi
     # trend (like a step change in volume) dominates raw autocorrelation and masks a genuine
     # cycle underneath -- verified directly: a real 4-period cycle sitting under a level shift
     # scored higher at the wrong lag on raw values, and only stood out clearly once detrended.
+    # score each candidate on BOTH the raw series and its first differences, and take the
+    # stronger of the two. Raw works well for a clean cycle; differencing rescues a cycle
+    # buried under a level shift. Verified that using differencing alone was WORSE -- it
+    # destroyed a clean signal that raw correlation found easily.
+    def _scores(x):
+        x = x - x.mean()
+        den = float(np.dot(x, x))
+        return (lambda lag: float(np.dot(x[:-lag], x[lag:]) / den)) if den > 0 else (lambda lag: 0.0)
+
+    raw_score = _scores(v)
     d = np.diff(v)
-    if len(d) < 8:
-        return None
-    d = d - d.mean()
-    denom = float(np.dot(d, d))
-    if denom <= 0:
-        return None
+    diff_score = _scores(d) if len(d) >= 8 else (lambda lag: 0.0)
+
     best, best_corr = None, min_corr
     for lag in candidates:
-        if len(d) < lag * 2 + 2:      # need at least two full cycles to believe it
+        if n < lag * 2 + 2:      # need at least two full cycles to believe it
             continue
-        corr = float(np.dot(d[:-lag], d[lag:]) / denom)
+        corr = max(raw_score(lag), diff_score(lag) if len(d) >= lag * 2 + 2 else 0.0)
         if corr > best_corr:
             best, best_corr = lag, corr
     return best
@@ -2871,10 +2877,18 @@ with tab_dash:
             # report is intentionally KPI + charts only -- the detail tables were dropped so
             # it reads as a one-glance summary for a meeting rather than a data dump
 
-            trend_fig = go.Figure(go.Scatter(x=report_trend_df["period"], y=report_trend_df["kg"], mode="lines",
-                                              fill="tozeroy", line=dict(color="rgb(139,90,60)", width=2)))
-            trend_fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10),
-                                     xaxis_title="Week", yaxis_title="Total actual kg")
+            # match the Overview chart: a blue actual line (no fill), named series, last 6
+            # months only. The filled brown area over 2+ years was unreadable and the legend
+            # said "trace 0".
+            _rt = report_trend_df.tail(26)
+            trend_fig = go.Figure(go.Scatter(x=_rt["period"], y=_rt["kg"], mode="lines",
+                                              name="Actual", line=dict(color="#1f77b4", width=2)))
+            trend_fig.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10),
+                                     plot_bgcolor="white",
+                                     xaxis_title="Week", yaxis_title="Total kg",
+                                     yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                                     legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                                 xanchor="left", x=0))
             trend_chart_html = trend_fig.to_html(include_plotlyjs="cdn", full_html=False)
 
             # overlay the backtested forecast line, exactly as the Overview chart shows it,
@@ -2886,13 +2900,42 @@ with tab_dash:
                     _rep_bt = _rep_bt.copy()
                     _rep_bt["forecast_kg"] = _rep_bt["forecast_kg"] + _rep_bt["period"].map(_rep_adj).fillna(0)
                     trend_fig.add_trace(go.Scatter(
-                        x=_rep_bt["period"], y=_rep_bt["forecast_kg"], mode="lines",
+                        x=_rep_bt[_rep_bt["period"].isin(_rt["period"])]["period"],
+                        y=_rep_bt[_rep_bt["period"].isin(_rt["period"])]["forecast_kg"], mode="lines",
                         name="Auto forecast (backtested)", line=dict(color="#8b5a3c", dash="dash")))
                     trend_fig.update_layout(showlegend=True, legend=dict(
                         orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
                     trend_chart_html = trend_fig.to_html(include_plotlyjs="cdn", full_html=False)
             except Exception:
                 pass  # report should still generate if the backtest can't be computed
+
+            # the three segment charts, same as the Overview page
+            seg_charts_html = ""
+            try:
+                for _lab, _sdf in split_into_segments(sales_df).items():
+                    _sagg = aggregate_periods(_sdf, ["product_type"], "W")
+                    _sagg = _sagg.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period").tail(26)
+                    if len(_sagg) < 2:
+                        continue
+                    _sfig = go.Figure(go.Scatter(x=_sagg["period"], y=_sagg["actual_kg"], mode="lines",
+                                                  name="Actual", line=dict(color="#1f77b4", width=2)))
+                    _sproj = project_forward_with_range(_sagg["actual_kg"].tolist(), None,
+                                                         n_periods=8, keep_trend=True)
+                    if not _sproj.empty:
+                        _last = pd.Timestamp(_sagg["period"].iloc[-1])
+                        _fx = [(_last + pd.Timedelta(weeks=i + 1)).date().isoformat()
+                               for i in range(len(_sproj))]
+                        _sfig.add_trace(go.Scatter(x=_fx, y=_sproj["forecast_kg"], mode="lines",
+                                                    name="Forecast (ahead)", line=dict(color="#555", width=2)))
+                    _sfig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10),
+                                         plot_bgcolor="white", yaxis_title="kg",
+                                         yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                                         legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                                     xanchor="left", x=0))
+                    seg_charts_html += f"<h3 style='font-size:14px;margin-top:1.2rem'>{_lab}</h3>"
+                    seg_charts_html += _sfig.to_html(include_plotlyjs=False, full_html=False)
+            except Exception:
+                pass
 
             # the breakdown exactly as it's filtered on screen, not a fixed top-15 bar chart
             bar_chart_html = ""
@@ -2921,6 +2964,8 @@ th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
 {cap_html}
 <h2>Overall trend — actual sales</h2>
 {trend_chart_html}
+<h2>Forecast by segment</h2>
+{seg_charts_html if seg_charts_html else "<p>Not enough history per segment yet.</p>"}
 <h2>Forecast breakdown — by {st.session_state.get("_report_breakdown_label", "segment")}</h2>
 {bar_chart_html if bar_chart_html else "<p>Open the Dashboard breakdown first, then generate the report.</p>"}
 <p class="meta">Generated automatically from 49th Parallel's demand planning app.</p>

@@ -3667,19 +3667,36 @@ with tab_rates:
                 st.info("Pick at least one dimension above to see rates.")
             else:
                 _gcols = [_dims[p] for p in _picked]
-                _rates = compute_rates_by(sales_df, _gcols)
+                _q = st.text_input(
+                    "Search", key="rate_q", placeholder="e.g. OSEE12, Costco, 12oz",
+                    help="Searches ALL of your data — channel, item, bag size and customer — not just "
+                         "the dimensions you're grouping by. Searching an item while grouped by "
+                         "Channel gives you that item's rate per channel.")
+
+                # filter the RAW data first, then compute rates on what's left. Previously the
+                # search only looked at the grouped columns, so searching an item while grouped
+                # by Channel matched nothing and returned an empty table -- which looks like
+                # the item doesn't exist rather than like a search that couldn't apply.
+                _src = sales_df
+                if _q.strip():
+                    _term = _q.strip()
+                    _m = pd.Series(False, index=_src.index)
+                    for _col in ("channel", "product", "size_label", "customer"):
+                        if _col in _src.columns:
+                            _m |= _src[_col].astype(str).str.contains(_term, case=False, na=False)
+                    _src = _src[_m]
+                    if _src.empty:
+                        st.warning(f"Nothing in your sales data matches '{_term}' — check the spelling "
+                                   "against the item and channel names in your uploads.")
+
+                _rates = compute_rates_by(_src, _gcols) if not _src.empty else pd.DataFrame()
                 if _rates.empty:
-                    st.info("Not enough data for that combination.")
+                    if not _q.strip():
+                        st.info("Not enough data for that combination.")
                 else:
-                    _q = st.text_input("Search within these results", key="rate_q",
-                                        placeholder="e.g. OSEE12, Costco, 12oz")
                     _view = _rates
-                    if _q.strip():
-                        _mask = pd.Series(False, index=_view.index)
-                        for gc in _gcols:
-                            _mask |= _view[gc].astype(str).str.contains(_q.strip(), case=False, na=False)
-                        _view = _view[_mask]
-                    st.caption(f"Showing {len(_view):,} of {len(_rates):,} rows — "
+                    _scope = f" matching '{_q.strip()}'" if _q.strip() else ""
+                    st.caption(f"Showing {len(_view):,} row(s){_scope} — "
                                f"grouped by {', '.join(_picked).lower()}, last 45 days.")
                     st.dataframe(
                         _view[_gcols + ["$ per kg", "kg per $1 CAD", "total_kg", "lines"]]

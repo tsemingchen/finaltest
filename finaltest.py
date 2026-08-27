@@ -1364,16 +1364,37 @@ def compute_weekly_actuals_by(sales_df, group_cols):
     return g
 
 
-def aggregate_periods(sales_df, group_cols, freq):
-    """Groups actual kg into weekly ('W') or monthly ('M') buckets, for any dimensions."""
+def aggregate_periods(sales_df, group_cols, freq, drop_incomplete=True):
+    """Groups actual kg into weekly ('W') or monthly ('M') buckets, for any dimensions.
+
+    Drops the final period when it's clearly incomplete. Real bug this fixes: with only one
+    week of August uploaded, the monthly aggregate read 6,180 kg against ~30,000 kg months
+    either side. The model has no way to know that's a partial month rather than demand
+    collapsing 83%, so it forecast the rest of the year from a false floor -- producing a
+    wild, meaningless projection. A partial period is not a data point about demand."""
     d = sales_df.copy()
     d["record_date"] = pd.to_datetime(d["record_date"], errors="coerce")
     d = d.dropna(subset=["record_date"])
+    if d.empty:
+        return pd.DataFrame(columns=list(group_cols) + ["period", "actual_kg"])
     if freq == "W":
         d["period"] = (d["record_date"] - pd.to_timedelta(d["record_date"].dt.weekday, unit="D")).dt.date.astype(str)
     else:
         d["period"] = d["record_date"].dt.to_period("M").astype(str)
     g = d.groupby(list(group_cols) + ["period"], as_index=False)["kg"].sum().rename(columns={"kg": "actual_kg"})
+
+    if drop_incomplete and not g.empty:
+        _last_day = d["record_date"].max()
+        if freq == "M":
+            # a month is complete only if data reaches its final day
+            _month_end = (_last_day.to_period("M").to_timestamp("M"))
+            if _last_day < _month_end:
+                g = g[g["period"] != str(_last_day.to_period("M"))]
+        else:
+            # a week is complete only if data reaches its Sunday
+            _week_start = _last_day - pd.Timedelta(days=int(_last_day.weekday()))
+            if _last_day < _week_start + pd.Timedelta(days=6):
+                g = g[g["period"] != str(_week_start.date())]
     return g
 
 
@@ -2347,6 +2368,15 @@ with tab_dash:
                        "is a proportional split of a total; the percentages shown are simply what "
                        "each segment's own forecast worked out to be.")
             pt_horizon = st.radio("Show by", ["Week", "Month"], horizontal=True, key="pt_horizon")
+            if has_data:
+                _ld = pd.to_datetime(sales_df["record_date"], errors="coerce").max()
+                if pd.notna(_ld):
+                    _me = _ld.to_period("M").to_timestamp("M")
+                    if _ld < _me and pt_horizon == "Month":
+                        st.info(f"{_ld.strftime('%B')} is still in progress (data through "
+                                f"{_ld.strftime('%b %d')}), so it's excluded from the monthly view. "
+                                "A part-month total would look like a collapse in demand and would "
+                                "distort every month after it.")
             n_periods_shown = 8 if pt_horizon == "Week" else 6
             n_history_shown = 6 if pt_horizon == "Week" else 6
             freq = "W" if pt_horizon == "Week" else "M"

@@ -2489,11 +2489,43 @@ with tab_dash:
                         continue
 
                     _stored = get_stored_order(pt, "W")
-                    projection_pt = project_forward_with_range(
-                        agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown,
-                        keep_trend=True,
-                        order=_stored[0] if _stored else None,
-                        seasonal_period=(_stored[1][3] if _stored and _stored[1][3] else None))
+                    if freq == "M":
+                        # Forecast WEEKLY and roll up to months, rather than fitting on the
+                        # monthly series directly. Real problem: with about 7 complete months
+                        # of history, a monthly model is estimated from 7 points -- too few to
+                        # be stable, and too few for seasonality detection (needs 20+). That's
+                        # why one segment converged to a flat line while another oscillated
+                        # wildly: not a difference in the business, just noise in an
+                        # under-determined fit. The weekly series has ~30 points, so forecasting
+                        # there and aggregating uses all the data and behaves consistently.
+                        _wagg = aggregate_periods(pt_df, ["product_type"], "W")
+                        _wagg = _wagg.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period")
+                        _wproj = project_forward_with_range(
+                            _wagg["actual_kg"].tolist(), None,
+                            n_periods=n_periods_shown * 5,  # enough weeks to cover the months shown
+                            keep_trend=True,
+                            order=_stored[0] if _stored else None,
+                            seasonal_period=(_stored[1][3] if _stored and _stored[1][3] else None))
+                        if not _wproj.empty:
+                            _wlast = pd.Timestamp(_wagg["period"].iloc[-1])
+                            _wproj = _wproj.copy()
+                            _wproj["_date"] = [_wlast + pd.Timedelta(weeks=i + 1) for i in range(len(_wproj))]
+                            _wproj["_m"] = _wproj["_date"].dt.to_period("M").astype(str)
+                            _rolled = _wproj.groupby("_m", as_index=False).agg(
+                                forecast_kg=("forecast_kg", "sum"), low=("low", "sum"), high=("high", "sum"),
+                                _weeks=("forecast_kg", "size"))
+                            # drop any trailing month the projection only partly covers
+                            _rolled = _rolled[_rolled["_weeks"] >= 4].head(n_periods_shown)
+                            _rolled["step"] = range(1, len(_rolled) + 1)
+                            projection_pt = _rolled[["step", "forecast_kg", "low", "high"]]
+                        else:
+                            projection_pt = pd.DataFrame()
+                    else:
+                        projection_pt = project_forward_with_range(
+                            agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown,
+                            keep_trend=True,
+                            order=_stored[0] if _stored else None,
+                            seasonal_period=(_stored[1][3] if _stored and _stored[1][3] else None))
                     _detected = detect_seasonal_period(agg_pt["actual_kg"].tolist())
                     if _detected:
                         st.caption(f"Repeating {_detected}-period cycle detected — the forecast follows it.")

@@ -828,6 +828,53 @@ def trend_forecast_seasonal(history_kg, damping=0.6):
     return trend_forecast(history_kg, damping=damping)
 
 
+def get_stored_order(label, freq="W"):
+    """Reads a previously-searched best model order for a segment, or None.
+
+    Deliberately NEVER runs a search itself -- the search is expensive (measured at 20-40+
+    seconds per series) and belongs behind an explicit button, not on a page load. Until
+    someone runs it, forecasting uses the ARIMA(1,1,1) default, which is a reasonable
+    general-purpose choice; once a search has been run, its result is reused indefinitely."""
+    try:
+        row = pd.read_sql(
+            "SELECT * FROM best_model_cache WHERE product_type = ? AND freq = ? ORDER BY id DESC LIMIT 1",
+            conn, params=(label, freq))
+        if row.empty:
+            return None
+        r = row.iloc[0]
+        return ((int(r["order_p"]), int(r["order_d"]), int(r["order_q"])),
+                (int(r["seasonal_p"]), int(r["seasonal_d"]), int(r["seasonal_q"]), int(r["seasonal_m"])),
+                str(r["found_at"])[:10])
+    except Exception:
+        return None
+
+
+def search_best_order(label, series, freq="W"):
+    """Runs a real auto_arima search for one segment and stores the result. Called ONLY from
+    the explicit button, never automatically."""
+    order, seasonal_order = (1, 1, 1), (0, 0, 0, 0)
+    try:
+        from pmdarima import auto_arima
+        m = detect_seasonal_period(list(series))
+        model = auto_arima(
+            np.asarray(series, dtype=float),
+            seasonal=bool(m), m=m or 1,
+            start_p=1, start_q=0, max_p=3, max_q=3, max_d=2,
+            start_P=0, start_Q=0, max_P=1, max_Q=1, max_D=1,
+            stepwise=True, suppress_warnings=True, error_action="ignore",
+        )
+        order, seasonal_order = model.order, model.seasonal_order
+    except Exception:
+        pass
+    conn.execute("DELETE FROM best_model_cache WHERE product_type = ? AND freq = ?", (label, freq))
+    conn.execute("""INSERT INTO best_model_cache (product_type, freq, order_p, order_d, order_q,
+        seasonal_p, seasonal_d, seasonal_q, seasonal_m, found_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (label, freq, order[0], order[1], order[2], seasonal_order[0], seasonal_order[1],
+         seasonal_order[2], seasonal_order[3], datetime.now().isoformat()))
+    conn.commit()
+    return order, seasonal_order
+
+
 def find_best_order_cached(pt, series, freq, refit_days=SEASONAL_REFIT_DAYS):
     """Finds the best-fitting SARIMA order for a product type's own aggregated series, using
     a real auto_arima search -- same validated constraints from earlier testing: start_p=1
@@ -1663,7 +1710,7 @@ def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13), min_corr=0
 
 
 def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_trend=False,
-                                seasonal_period=None):
+                                seasonal_period=None, order=None):
     """Projects multiple periods ahead using a single non-seasonal ARIMA(1,1,1) fit, which
     produces the whole path at once with real statistical confidence intervals (verified:
     recursive re-feeding through ARIMA produced a forecast that more than doubled over 8
@@ -1695,7 +1742,7 @@ def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_tre
                 # a multi-month projection go dead flat, which is what people were seeing on
                 # the monthly view. The trend term keeps a real slope; the cap below stops it
                 # extrapolating away to something implausible.
-                model = SARIMAX(vals, order=(1, 1, 1), seasonal_order=seasonal,
+                model = SARIMAX(vals, order=(order or (1, 1, 1)), seasonal_order=seasonal,
                                  trend="t" if keep_trend else "n",
                                  enforce_stationarity=False, enforce_invertibility=False)
                 fit = model.fit(disp=False)
@@ -2441,9 +2488,12 @@ with tab_dash:
                         st.info("Not enough history yet for this segment.")
                         continue
 
+                    _stored = get_stored_order(pt, "W")
                     projection_pt = project_forward_with_range(
                         agg_pt["actual_kg"].tolist(), None, n_periods=n_periods_shown,
-                        keep_trend=True)
+                        keep_trend=True,
+                        order=_stored[0] if _stored else None,
+                        seasonal_period=(_stored[1][3] if _stored and _stored[1][3] else None))
                     _detected = detect_seasonal_period(agg_pt["actual_kg"].tolist())
                     if _detected:
                         st.caption(f"Repeating {_detected}-period cycle detected — the forecast follows it.")
@@ -3839,6 +3889,47 @@ with tab_forecast:
                      use_container_width=True)
         total_kg = forecast_by_cp["forecast_kg"].sum()
         st.metric("Total forecast kg (next unforecasted week, all channels/products)", f"{total_kg:,.0f} kg")
+
+        # ---- model tuning: searched once, on demand, never on a page load ----
+        with st.expander("Forecast model settings"):
+            st.caption(
+                "Each segment is forecast with an ARIMA model. By default it uses a sensible "
+                "general-purpose configuration, ARIMA(1,1,1). Running a search tests many "
+                "configurations against your own history and keeps whichever fits best. It takes "
+                "a minute or two, so it runs only when you ask — the result is stored and reused "
+                "until you search again. Worth re-running if accuracy starts drifting."
+            )
+            _segs = split_into_segments(sales_df) if has_data else {}
+            if _segs:
+                _rows = []
+                for _lab in _segs:
+                    _s = get_stored_order(_lab, "W")
+                    _rows.append({
+                        "Segment": _lab,
+                        "Model in use": f"ARIMA{_s[0]}" if _s else "ARIMA(1, 1, 1) — default",
+                        "Seasonal": (f"every {_s[1][3]} weeks" if _s and _s[1][3] else "none"),
+                        "Last searched": _s[2] if _s else "never",
+                    })
+                st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+                if st.button("Find the best model for each segment", key="run_model_search"):
+                    _prog = st.progress(0.0, text="Searching…")
+                    _out = []
+                    for _i, (_lab, _sdf) in enumerate(_segs.items()):
+                        _prog.progress(_i / len(_segs), text=f"Searching {_lab}…")
+                        _ag = aggregate_periods(_sdf, ["product_type"], "W")
+                        _ser = _ag.groupby("period", as_index=False)["actual_kg"].sum() \
+                            .sort_values("period")["actual_kg"].tolist()
+                        if len(_ser) < 12:
+                            _out.append(f"{_lab}: not enough history to search — keeping the default")
+                            continue
+                        _o, _so = search_best_order(_lab, _ser, "W")
+                        _out.append(f"{_lab}: ARIMA{_o}" + (f" seasonal every {_so[3]} weeks" if _so[3] else ""))
+                    _prog.empty()
+                    reset_adjustment_state()
+                    st.success("Search complete — these models are now in use:\n\n" +
+                               "\n\n".join(f"- {line}" for line in _out))
+                    st.rerun()
 
         # visible consensus check -- these per-item numbers are reconciled to the same
         # segment-based total the Dashboard shows, so the two should agree. An active

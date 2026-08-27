@@ -2441,6 +2441,26 @@ with tab_dash:
                         # two views could drift apart again even after being fixed once. One
                         # function, called from both places, is what actually prevents that.
                         wf = walk_forward_segment(pt_df, n_periods=n_history_shown, freq="W")
+                        # apply the events that belonged to THIS segment, for the weeks they
+                        # were actually live. Missing this is why the segment forecasts summed
+                        # to more than the Overview total: the chart and the accuracy KPI had
+                        # event adjustment, these tables didn't. Uses the full event record
+                        # (including stopped ones) so a week already forecast while an event
+                        # was live keeps that number even after the event is turned off.
+                        if not wf.empty and not all_events_all.empty:
+                            _seg_ev = all_events_all.copy()
+                            _ptl = pt_df[["product"]].drop_duplicates()
+                            _ptl["_k"] = _ptl["product"].astype(str).str.strip().str.casefold()
+                            _seg_ev["_k"] = _seg_ev["product"].astype(str).str.strip().str.casefold()
+                            _seg_ev = _seg_ev[_seg_ev["_k"].isin(set(_ptl["_k"]))]
+                            if "channel" in pt_df.columns:
+                                _chans = set(pt_df["channel"].astype(str).str.strip().str.casefold())
+                                _seg_ev = _seg_ev[
+                                    _seg_ev["channel"].astype(str).str.strip().str.casefold().isin(_chans)]
+                            if not _seg_ev.empty:
+                                _wadj = event_adjustment_by_period(_seg_ev, wf["period"].tolist(), freq="W")
+                                wf = wf.copy()
+                                wf["forecast_kg"] = wf["forecast_kg"] + wf["period"].map(_wadj).fillna(0)
                         stored_by_week = wf.rename(columns={"period": "Period", "forecast_kg": "Forecast (kg)"})
                         recent_actual = recent_actual.merge(stored_by_week, on="Period", how="left")
                     else:

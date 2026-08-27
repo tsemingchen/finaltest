@@ -276,6 +276,16 @@ def reset_all_derived_state():
         st.session_state.pop(key, None)
 
 
+def reset_adjustment_state():
+    """Lighter reset for event/override changes. Those don't touch the SALES data, so there's
+    no reason to throw away the cached sales history -- clearing it forces a full re-download
+    from Supabase, which is slow and burns billed egress for no benefit. Only the stored
+    accuracy results need clearing; everything else recomputes from the live event list on
+    the next run anyway."""
+    for key in ["backtest_df"]:
+        st.session_state.pop(key, None)
+
+
 def insert_dataframe(table_name, df, batch_size=300, show_progress=False):
     """Replaces pandas' df.to_sql() -- that function has special-cased internals that only
     work with a real SQLAlchemy connection or an actual sqlite3.Connection object, so it
@@ -1582,8 +1592,13 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), min_corr=0.18):
+def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13), min_corr=0.18):
     """Finds a genuine repeating cycle in the data, or returns None.
+
+    Candidates stop at 13 periods deliberately: a 52-week seasonal fit was measured at 2.5s
+    versus 0.4s for a short cycle, and with several segments plus the bag breakdown that adds
+    up on every page load. Short ordering rhythms are also what actually drives week-to-week
+    demand here; a yearly cycle needs years of clean history to estimate honestly anyway.
 
     A flat forward forecast means the model found no repeating structure -- only noise. The
     honest way to make a forecast move up and down is to model a cycle that's really there
@@ -2041,6 +2056,7 @@ with tab_dash:
         # event existed. Joining through each product's known classification fixes this the
         # same way everything else this session got reconciled.
         pipeline_by_type = {}
+        pipeline_by_segment = {}
         if not pipeline_by_cp.empty and "product_type" in sales_df.columns:
             # match on a normalised key: an event typed with different case or a stray trailing
             # space would otherwise fail to find its product and get dumped into "(not tracked)".
@@ -2054,22 +2070,35 @@ with tab_dash:
             pipeline_typed = _pl.merge(_lookup[["_k", "product_type"]], on="_k", how="left")
             pipeline_typed["product_type"] = pipeline_typed["product_type"].fillna("(not tracked)")
             pipeline_by_type = pipeline_typed.groupby("product_type")["pipeline_kg"].sum().to_dict()
+
+            # ALSO attribute each event to its actual SEGMENT, using channel as well as product
+            # type. Real bug: grouping by product type alone couldn't tell "Staple — Specialty
+            # Retail" apart from "Staple — other channels", so a Specialty Retail event was
+            # spread across both by forecast weight instead of landing on the segment it
+            # genuinely belongs to.
+            pipeline_by_segment = {}
+            _pt2 = pipeline_typed.copy()
+            _pt2["_isr"] = _pt2["channel"].astype(str).str.strip().str.casefold() == \
+                MAJOR_STAPLE_CHANNEL.strip().casefold()
+            for _, _r in _pt2.iterrows():
+                if _r["product_type"] == "Single":
+                    _seg = "Single"
+                elif _r["product_type"] == "Staple":
+                    _seg = f"Staple — {MAJOR_STAPLE_CHANNEL}" if _r["_isr"] else "Staple — other channels"
+                else:
+                    continue
+                pipeline_by_segment[_seg] = pipeline_by_segment.get(_seg, 0.0) + float(_r["pipeline_kg"])
         pipeline_total_next_week = pipeline_by_cp["pipeline_kg"].sum() if not pipeline_by_cp.empty else 0
 
         # each segment's forecast now includes its own attributed pipeline events, so the
         # segment panels stay consistent with the KPI total below. Staple events are
         # apportioned across the two Staple segments by their own forecast weights.
-        staple_labels_kpi = [l for l in type_level_forecasts if l.startswith("Staple")]
-        staple_total_kpi = sum(type_level_forecasts[l] for l in staple_labels_kpi) or 1
-        type_level_forecasts_with_pipeline = {}
-        for label, val in type_level_forecasts.items():
-            if label == "Single":
-                type_level_forecasts_with_pipeline[label] = val + pipeline_by_type.get("Single", 0)
-            elif label in staple_labels_kpi:
-                weight = val / staple_total_kpi
-                type_level_forecasts_with_pipeline[label] = val + pipeline_by_type.get("Staple", 0) * weight
-            else:
-                type_level_forecasts_with_pipeline[label] = val
+        # add each event to the exact segment it belongs to (channel-aware), rather than
+        # splitting a product-type total across segments by weight
+        type_level_forecasts_with_pipeline = {
+            label: val + pipeline_by_segment.get(label, 0.0)
+            for label, val in type_level_forecasts.items()
+        }
         unattributed_pipeline = pipeline_by_type.get("(not tracked)", 0)  # events on products with no known type
 
         # fold manual overrides into the segment numbers BEFORE totalling, so the headline
@@ -2323,18 +2352,12 @@ with tab_dash:
             freq = "W" if pt_horizon == "Week" else "M"
 
             segment_forecasts = compute_segment_forecast(sales_df, freq=freq)
-            if freq == "W" and pipeline_by_type:
-                # attribute pipeline events -- Single events go to Single; Staple events are
-                # apportioned between the two Staple segments by their own forecast weights,
-                # since an event logged at product level doesn't say which channel it lands in
-                staple_labels = [l for l in segment_forecasts if l.startswith("Staple")]
-                staple_total_fc = sum(segment_forecasts[l] for l in staple_labels) or 1
+            if freq == "W" and pipeline_by_segment:
+                # each event lands on the exact segment it belongs to, matched on channel as
+                # well as product type -- so a Specialty Retail event moves the Specialty
+                # Retail segment specifically, not both Staple segments proportionally
                 for label in list(segment_forecasts):
-                    if label == "Single":
-                        segment_forecasts[label] += pipeline_by_type.get("Single", 0)
-                    elif label in staple_labels:
-                        weight = segment_forecasts[label] / staple_total_fc
-                        segment_forecasts[label] += pipeline_by_type.get("Staple", 0) * weight
+                    segment_forecasts[label] += pipeline_by_segment.get(label, 0.0)
 
             # same override folding the Overview KPI uses, so these tables and charts agree
             # with the headline number instead of quietly ignoring overrides
@@ -2662,9 +2685,18 @@ with tab_dash:
                                 if dim not in ev or pd.isna(ev.get(dim)):
                                     continue
                                 target = str(ev[dim])
-                                actual = str(row[dim]) if dim in group_cols else \
-                                    (str(filter_values[dim]) if dim in filter_values else None)
-                                if actual is None or actual != target:
+                                if dim in group_cols:
+                                    actual = str(row[dim])
+                                elif dim in filter_values:
+                                    actual = str(filter_values[dim])
+                                else:
+                                    # this dimension isn't visible in the current breakdown --
+                                    # e.g. breaking down by channel while the event is tied to
+                                    # a specific item. Treat it as "matches anything" rather
+                                    # than a failed match: previously the event was skipped
+                                    # entirely, so the rows summed to MORE than the KPI total.
+                                    continue
+                                if actual != target:
                                     ok = False
                                     break
                             if ok:
@@ -2706,6 +2738,20 @@ with tab_dash:
                 st.session_state["_report_breakdown_label"] = " / ".join(group_cols)
                 period_label = {"Next week": "Forecast kg (next week)", "Next month": "Forecast kg (next month)",
                                  "Next year": "Forecast kg (next year, extrapolated)"}[horizon]
+
+                # hard reconciliation check against the Overview KPI. The breakdown is built
+                # from shares plus per-row event/override adjustments, and any row that fails
+                # to match an adjustment leaves the rows summing to something different from
+                # the headline number -- which is exactly the kind of silent disagreement this
+                # dashboard has had to hunt down repeatedly.
+                if horizon == "Next week" and next_week_kg_all:
+                    _row_sum = float(shares["forecast_kg"].sum())
+                    _gap = _row_sum - next_week_kg_all
+                    if abs(_gap) > max(1.0, next_week_kg_all * 0.005):
+                        st.warning(
+                            f"These rows sum to {_row_sum:,.0f} kg but the Overview total is "
+                            f"{next_week_kg_all:,.0f} kg — a {_gap:+,.0f} kg gap. Usually an event or "
+                            "override that couldn't be matched to a row at this breakdown level.")
 
                 st.metric(f"Total — {horizon.lower()}", f"{canonical_total:,.0f} kg")
                 if event_applied_rows:
@@ -4156,14 +4202,14 @@ with tab_pipeline:
                     conn.execute("UPDATE pipeline_events SET active = 0, deactivated_at = ? WHERE id = ?",
                                  (datetime.now().strftime("%Y-%m-%d"), int(_am[_pick_off]),))
                     conn.commit()
-                    reset_all_derived_state()
+                    reset_adjustment_state()
                     st.warning("Event stopped — it no longer affects the forecast, but stays in the record.")
                     st.rerun()
             with cdel:
                 if st.button("Delete permanently", key="ev_del"):
                     conn.execute("DELETE FROM pipeline_events WHERE id = ?", (int(_am[_pick_off]),))
                     conn.commit()
-                    reset_all_derived_state()
+                    reset_adjustment_state()
                     st.warning("Deleted. Past forecast numbers that included this event have changed.")
                     st.rerun()
 
@@ -4175,7 +4221,7 @@ with tab_pipeline:
                 conn.execute("UPDATE pipeline_events SET active = 1, deactivated_at = NULL WHERE id = ?",
                              (int(_im[_pick_on]),))
                 conn.commit()
-                reset_all_derived_state()
+                reset_adjustment_state()
                 st.success("Event reactivated — it applies to the forecast again.")
                 st.rerun()
 

@@ -2285,6 +2285,21 @@ with tab_dash:
             d_trend["period"] = d_trend["record_date"].dt.to_period("M").astype(str)
         trend_agg = d_trend.groupby("period", as_index=False)["kg"].sum().sort_values("period")
 
+        # This chart builds its own aggregation rather than going through aggregate_periods,
+        # so the partial-month exclusion has to be applied here too -- without it the Month
+        # view still showed August at ~6,000 kg (one week standing in for a whole month)
+        # against ~30,000 kg months either side, and forecast the year from that false floor.
+        # Weekly is deliberately left untouched.
+        if trend_freq == "Month" and not trend_agg.empty:
+            _tl = d_trend["record_date"].max()
+            if pd.notna(_tl) and _tl < _tl.to_period("M").to_timestamp("M"):
+                _drop = str(_tl.to_period("M"))
+                trend_agg = trend_agg[trend_agg["period"] != _drop]
+                st.caption(f"{_tl.strftime('%B')} is still in progress (data through "
+                           f"{_tl.strftime('%b %d')}) and is excluded from this monthly view — "
+                           "a part-month total would read as a collapse in demand and distort "
+                           "everything forecast after it.")
+
         # same shared top-down calculation the Staple/Single table uses -- this is the actual
         # fix for the inconsistency: previously this summed many small per-item backtests
         # (bottom-up), while the Staple/Single table used one aggregate fit per type
@@ -4076,6 +4091,13 @@ with tab_salesplan:
             company_monthly["record_date"] = pd.to_datetime(company_monthly["record_date"], errors="coerce")
             company_monthly["month"] = company_monthly["record_date"].dt.to_period("M").astype(str)
             company_monthly_agg = company_monthly.groupby("month", as_index=False)["kg"].sum().sort_values("month")
+            # same partial-month exclusion as the dashboard -- projecting the rest of the year
+            # from a month that only has one week of data produces a wildly wrong plan
+            # comparison, which is worse than no comparison
+            _cl = company_monthly["record_date"].max()
+            if pd.notna(_cl) and _cl < _cl.to_period("M").to_timestamp("M"):
+                company_monthly_agg = company_monthly_agg[
+                    company_monthly_agg["month"] != str(_cl.to_period("M"))]
             if len(company_monthly_agg) >= 2:
                 with st.spinner("Computing demand-sensing projection for remaining months..."):
                     proj_recon = project_forward_with_range(company_monthly_agg["kg"].tolist(), None,

@@ -1367,11 +1367,15 @@ def compute_weekly_actuals_by(sales_df, group_cols):
 def aggregate_periods(sales_df, group_cols, freq, drop_incomplete=True):
     """Groups actual kg into weekly ('W') or monthly ('M') buckets, for any dimensions.
 
-    Drops the final period when it's clearly incomplete. Real bug this fixes: with only one
-    week of August uploaded, the monthly aggregate read 6,180 kg against ~30,000 kg months
-    either side. The model has no way to know that's a partial month rather than demand
-    collapsing 83%, so it forecast the rest of the year from a false floor -- producing a
-    wild, meaningless projection. A partial period is not a data point about demand."""
+    Drops the final MONTH when it's incomplete. Real bug this fixes: with only one week of
+    August uploaded, the monthly aggregate read 6,180 kg against ~30,000 kg months either
+    side. The model has no way to know that's a partial month rather than demand collapsing
+    83%, so it forecast the rest of the year from a false floor -- the projection swung from
+    -2.3M to +7.5M kg.
+
+    Weekly aggregation is intentionally untouched: a part-week is a minor distortion the
+    weekly model already copes with, and excluding it changed weekly numbers that were
+    correct."""
     d = sales_df.copy()
     d["record_date"] = pd.to_datetime(d["record_date"], errors="coerce")
     d = d.dropna(subset=["record_date"])
@@ -1383,18 +1387,17 @@ def aggregate_periods(sales_df, group_cols, freq, drop_incomplete=True):
         d["period"] = d["record_date"].dt.to_period("M").astype(str)
     g = d.groupby(list(group_cols) + ["period"], as_index=False)["kg"].sum().rename(columns={"kg": "actual_kg"})
 
-    if drop_incomplete and not g.empty:
+    if drop_incomplete and freq == "M" and not g.empty:
         _last_day = d["record_date"].max()
         if freq == "M":
             # a month is complete only if data reaches its final day
             _month_end = (_last_day.to_period("M").to_timestamp("M"))
             if _last_day < _month_end:
                 g = g[g["period"] != str(_last_day.to_period("M"))]
-        else:
-            # a week is complete only if data reaches its Sunday
-            _week_start = _last_day - pd.Timedelta(days=int(_last_day.weekday()))
-            if _last_day < _week_start + pd.Timedelta(days=6):
-                g = g[g["period"] != str(_week_start.date())]
+        # Weekly is deliberately left alone. A part-week is a small distortion the weekly
+        # model already handles, and dropping it changed weekly numbers that were correct --
+        # the problem being solved here is specifically the monthly view, where one week
+        # standing in for a whole month is an 80%+ distortion.
     return g
 
 

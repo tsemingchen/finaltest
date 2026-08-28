@@ -4031,65 +4031,72 @@ with tab_salesplan:
 
     if plan_file is not None and plan_layout.startswith("Wide"):
         _raw = pd.read_excel(plan_file) if plan_file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(plan_file)
-        st.dataframe(_raw.head(8), use_container_width=True)
-        _label_col = st.selectbox("Which column holds the channel names?", list(_raw.columns), key="wide_label")
-        # month columns are the ones that parse as real dates -- the template uses actual
-        # datetime headers, so this identifies them without asking the user to list them
-        _month_cols = [col for col in _raw.columns
-                       if isinstance(col, (datetime, pd.Timestamp))]
-        if not _month_cols:
-            st.warning("No date-style column headers found. If your months are text (e.g. 'Jan 2026'), "
-                       "use the 'Long' layout instead, or reformat the headers as dates.")
+        st.dataframe(_raw.head(10), use_container_width=True)
+
+        _label_col = _raw.columns[0]
+        _date_cols = [col for col in _raw.columns if isinstance(col, datetime)]
+        if not _date_cols:
+            st.warning("No date-style column headers found in this file.")
         else:
-            st.caption(f"Found {len(_month_cols)} month columns: "
-                       f"{pd.Timestamp(_month_cols[0]).strftime('%b %Y')} to "
-                       f"{pd.Timestamp(_month_cols[-1]).strftime('%b %Y')}")
+            # This template encodes the plan year in the DAY part of each month header
+            # (…-01-26 = Jan of the 2026 plan, …-01-27 = Jan of the 2027 plan), with the two
+            # year blocks separated by a Notes column. Grouping by the day component is what
+            # keeps the 2026 and 2027 sections apart -- reading them all as one year would
+            # silently merge two plans on top of each other.
+            _by_year = {}
+            for col in _date_cols:
+                _by_year.setdefault(col.day, []).append(col)
+            _year_opts = {}
+            for _d, _cols in _by_year.items():
+                _yr = 2000 + _d if 20 <= _d <= 99 else pd.Timestamp(_cols[0]).year
+                _year_opts[f"{_yr} ({len(_cols)} months)"] = (_yr, _cols)
+
+            _pick_year = st.selectbox("Which plan year is in this file?", list(_year_opts.keys()))
+            _year, _month_cols = _year_opts[_pick_year]
+
             _unit = st.radio("These values are:", ["Revenue ($)", "Volume (kg)"], horizontal=True, key="wide_unit")
-            _year = st.number_input("Plan year", min_value=2000, max_value=2100,
-                                     value=int(pd.Timestamp(_month_cols[0]).year), key="wide_year")
-            if st.button("Import this plan", type="primary"):
-                # built row by row rather than with melt: the template can contain duplicate
-                # or unnamed column headers, and melt fails on those with an unhelpful
-                # internal pandas error. This is slower but predictable.
-                _records = []
-                for _pos, _mc in enumerate(_month_cols):
-                    _col_idx = list(_raw.columns).index(_mc) if list(_raw.columns).count(_mc) == 1 else None
-                    _series = _raw.iloc[:, _col_idx] if _col_idx is not None else _raw[_mc].iloc[:, 0]
-                    for _ri, _val in enumerate(_series):
-                        _num = pd.to_numeric(_val, errors="coerce")
-                        if pd.isna(_num):
+
+            _row_labels = _raw[_label_col].astype(str).fillna("")
+            _has_numbers = _raw[_month_cols].apply(pd.to_numeric, errors="coerce").notna().any(axis=1)
+            _usable = _raw[_has_numbers]
+            if _usable.empty:
+                st.warning("None of the rows in this file have numeric values in the month columns "
+                           "— the sheet may still be an empty template.")
+            else:
+                st.caption(f"{len(_usable)} row(s) have plan numbers: "
+                           + ", ".join(_usable[_label_col].astype(str).tolist()))
+                _which = st.multiselect(
+                    "Import which rows?", _usable[_label_col].astype(str).tolist(),
+                    default=_usable[_label_col].astype(str).tolist(),
+                    help="If only the Total row is filled in, import that — the app will compare "
+                         "it against the whole-company forecast.")
+
+                if st.button("Import this plan", type="primary"):
+                    _rows_written = 0
+                    for _, _r in _usable.iterrows():
+                        _name = str(_r[_label_col]).strip()
+                        if _name not in _which:
                             continue
-                        _records.append({
-                            _label_col: _raw[_label_col].iloc[_ri] if _label_col in _raw.columns else None,
-                            "month_dt": _mc,
-                            "value": float(_num),
-                        })
-                _long = pd.DataFrame(_records)
-                if not _long.empty:
-                    _long = _long.dropna(subset=[_label_col])
-                if _long.empty:
-                    st.warning("No numeric values found in those month columns — the sheet may still be "
-                               "an empty template.")
-                else:
-                    _long["month"] = pd.to_datetime(_long["month_dt"]).dt.month
-                    _long["channel"] = _long[_label_col].astype(str).str.strip()
-                    _long["product"] = "(all)"
-                    _long["value"] = pd.to_numeric(_long["value"], errors="coerce")
-                    rows_written = 0
-                    for _, r in _long.iterrows():
-                        _kg = _rev = None
-                        if _unit.startswith("Revenue"):
-                            _rev = float(r["value"])
-                        else:
-                            _kg = float(r["value"])
-                        conn.execute("""INSERT INTO sales_plan
-                            (plan_year, month, channel, product, planned_kg, planned_dollars, updated_by, updated_at, note)
-                            VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (str(_year), f"{int(r['month']):02d}", r["channel"], r["product"],
-                             _kg, _rev, "wide import", datetime.now().isoformat(), "imported from template"))
-                        rows_written += 1
+                        # a Total row is stored as a company-wide plan so it can be compared
+                        # against the total forecast rather than one channel's
+                        _is_total = "total" in _name.lower()
+                        _chan = "(total)" if _is_total else _name
+                        for _mc in _month_cols:
+                            _val = pd.to_numeric(_r[_mc], errors="coerce")
+                            if pd.isna(_val):
+                                continue
+                            _kg = float(_val) if _unit.startswith("Volume") else None
+                            _rev = float(_val) if _unit.startswith("Revenue") else None
+                            conn.execute("""INSERT INTO sales_plan
+                                (plan_year, month, channel, product, planned_kg, planned_dollars,
+                                 updated_by, updated_at, note)
+                                VALUES (?,?,?,?,?,?,?,?,?)""",
+                                (str(_year), f"{_mc.month:02d}", _chan, "(all)", _kg, _rev,
+                                 "template import", datetime.now().isoformat(),
+                                 "company total" if _is_total else "from template"))
+                            _rows_written += 1
                     conn.commit()
-                    st.success(f"Imported {rows_written} plan rows from the wide template.")
+                    st.success(f"Imported {_rows_written} plan rows for {_year}.")
                     st.rerun()
         plan_file = None  # handled above; skip the long-format path below
 
@@ -4193,17 +4200,38 @@ with tab_salesplan:
         "across the whole year). Treat far-future gaps as a rough signal, not a precise miss."
     )
 
-    plan_monthly = existing_plan.groupby("month", as_index=False)["planned_kg"].sum() if not existing_plan.empty else pd.DataFrame()
+    # Compare in whatever unit the plan was entered in. The company template is in revenue
+    # dollars, and converting that to kg just to compare against kg introduces avoidable
+    # error -- comparing dollars to dollars is both simpler and more faithful to the plan.
+    _plan_unit = "kg"
+    if not existing_plan.empty:
+        _has_kg = existing_plan["planned_kg"].notna().any()
+        _has_dollars = existing_plan["planned_dollars"].notna().any()
+        if _has_dollars and not _has_kg:
+            _plan_unit = "dollars"
+        elif _has_dollars and _has_kg:
+            _plan_unit = st.radio("Compare the plan in:", ["kg", "dollars"], horizontal=True, key="recon_unit")
+
+    _plan_col = "planned_kg" if _plan_unit == "kg" else "planned_dollars"
+    plan_monthly = existing_plan.groupby("month", as_index=False)[_plan_col].sum() \
+        .rename(columns={_plan_col: "planned_kg"}) if not existing_plan.empty else pd.DataFrame()
+    if not plan_monthly.empty:
+        plan_monthly = plan_monthly[plan_monthly["planned_kg"].notna() & (plan_monthly["planned_kg"] != 0)]
+
+    _unit_label = "kg" if _plan_unit == "kg" else "$"
 
     if plan_monthly.empty:
         st.info("Enter a plan above to see the reconciliation view.")
     elif not has_data:
         st.info("Upload sales history in tab 1 to compare the plan against.")
     else:
+        st.caption(f"Comparing in **{_unit_label}** — matching how the plan was entered.")
         actuals_monthly = sales_df.copy()
         actuals_monthly["record_date"] = pd.to_datetime(actuals_monthly["record_date"], errors="coerce")
         actuals_monthly["month"] = actuals_monthly["record_date"].dt.to_period("M").astype(str)
-        actuals_monthly = actuals_monthly.groupby("month", as_index=False)["kg"].sum().rename(columns={"kg": "actual_kg"})
+        _acol = "kg" if _plan_unit == "kg" else "revenue"
+        actuals_monthly = actuals_monthly.groupby("month", as_index=False)[_acol].sum() \
+            .rename(columns={_acol: "actual_kg"})
 
         recon = plan_monthly.merge(actuals_monthly, on="month", how="left").sort_values("month")
         missing_months = recon[recon["actual_kg"].isna()]["month"].tolist()

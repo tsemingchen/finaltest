@@ -4051,13 +4051,22 @@ with tab_salesplan:
                 _yr = 2000 + _d if 20 <= _d <= 99 else pd.Timestamp(_cols[0]).year
                 _year_opts[f"{_yr} ({len(_cols)} months)"] = (_yr, _cols)
 
-            _pick_year = st.selectbox("Which plan year is in this file?", list(_year_opts.keys()))
-            _year, _month_cols = _year_opts[_pick_year]
+            _pick_years = st.multiselect(
+                "Which plan year(s) to import?", list(_year_opts.keys()),
+                default=list(_year_opts.keys()),
+                help="This template holds two years side by side. Importing both gives you a "
+                     "continuous plan from January of the first year through December of the second.")
+            if not _pick_years:
+                st.info("Pick at least one plan year.")
+                st.stop()
+            _year_jobs = [_year_opts[k] for k in _pick_years]
+            _year, _month_cols = _year_jobs[0]
+            _all_month_cols = [mc for _, cols in _year_jobs for mc in cols]
 
             _unit = st.radio("These values are:", ["Revenue ($)", "Volume (kg)"], horizontal=True, key="wide_unit")
 
             _row_labels = _raw[_label_col].astype(str).fillna("")
-            _has_numbers = _raw[_month_cols].apply(pd.to_numeric, errors="coerce").notna().any(axis=1)
+            _has_numbers = _raw[_all_month_cols].apply(pd.to_numeric, errors="coerce").notna().any(axis=1)
             _usable = _raw[_has_numbers]
             if _usable.empty:
                 st.warning("None of the rows in this file have numeric values in the month columns "
@@ -4071,32 +4080,40 @@ with tab_salesplan:
                     help="If only the Total row is filled in, import that — the app will compare "
                          "it against the whole-company forecast.")
 
+                _replace = st.checkbox(
+                    f"Replace any existing {_year} plan rows (recommended)", value=True,
+                    help="Leave this on unless you're deliberately adding to an existing plan. "
+                         "Re-importing without it appends a second copy of every row.")
                 if st.button("Import this plan", type="primary"):
                     _rows_written = 0
-                    for _, _r in _usable.iterrows():
-                        _name = str(_r[_label_col]).strip()
-                        if _name not in _which:
-                            continue
-                        # a Total row is stored as a company-wide plan so it can be compared
-                        # against the total forecast rather than one channel's
-                        _is_total = "total" in _name.lower()
-                        _chan = "(total)" if _is_total else _name
-                        for _mc in _month_cols:
-                            _val = pd.to_numeric(_r[_mc], errors="coerce")
-                            if pd.isna(_val):
+                    for _yr, _cols in _year_jobs:
+                        if _replace:
+                            conn.execute("DELETE FROM sales_plan WHERE plan_year = ?", (str(_yr),))
+                        for _, _r in _usable.iterrows():
+                            _name = str(_r[_label_col]).strip()
+                            if _name not in _which:
                                 continue
-                            _kg = float(_val) if _unit.startswith("Volume") else None
-                            _rev = float(_val) if _unit.startswith("Revenue") else None
-                            conn.execute("""INSERT INTO sales_plan
-                                (plan_year, month, channel, product, planned_kg, planned_dollars,
-                                 updated_by, updated_at, note)
-                                VALUES (?,?,?,?,?,?,?,?,?)""",
-                                (str(_year), f"{_mc.month:02d}", _chan, "(all)", _kg, _rev,
-                                 "template import", datetime.now().isoformat(),
-                                 "company total" if _is_total else "from template"))
-                            _rows_written += 1
+                            # a Total row is stored as a company-wide plan so it can be compared
+                            # against the total forecast rather than one channel's
+                            _is_total = "total" in _name.lower()
+                            _chan = "(total)" if _is_total else _name
+                            for _mc in _cols:
+                                _val = pd.to_numeric(_r[_mc], errors="coerce")
+                                if pd.isna(_val):
+                                    continue
+                                _kg = float(_val) if _unit.startswith("Volume") else None
+                                _rev = float(_val) if _unit.startswith("Revenue") else None
+                                conn.execute("""INSERT INTO sales_plan
+                                    (plan_year, month, channel, product, planned_kg, planned_dollars,
+                                     updated_by, updated_at, note)
+                                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                                    (str(_yr), f"{_mc.month:02d}", _chan, "(all)", _kg, _rev,
+                                     "template import", datetime.now().isoformat(),
+                                     "company total" if _is_total else "from template"))
+                                _rows_written += 1
                     conn.commit()
-                    st.success(f"Imported {_rows_written} plan rows for {_year}.")
+                    st.success(f"Imported {_rows_written} plan rows across "
+                               f"{', '.join(str(y) for y, _ in _year_jobs)}.")
                     st.rerun()
         plan_file = None  # handled above; skip the long-format path below
 
@@ -4148,8 +4165,34 @@ with tab_salesplan:
     st.caption("Add, edit, or delete rows directly — this is how Sales keeps the plan updated over time.")
     existing_plan = pd.read_sql("SELECT * FROM sales_plan WHERE plan_year = ? ORDER BY month, channel, product",
                                  conn, params=(plan_year,))
-    edit_base = existing_plan[["channel", "product", "month", "planned_dollars", "planned_kg", "note"]] \
-        if not existing_plan.empty else pd.DataFrame(columns=["channel", "product", "month", "planned_dollars", "planned_kg", "note"])
+
+    # De-duplicate on the real key. Re-importing the same file (easy to do while getting the
+    # options right) previously appended a second full set of rows, so every month appeared
+    # twice with no way to tell which was current. Keeping the highest id keeps the most
+    # recent import and quietly discards the superseded one.
+    if not existing_plan.empty:
+        _before = len(existing_plan)
+        existing_plan = existing_plan.sort_values("id").drop_duplicates(
+            subset=["plan_year", "month", "channel", "product"], keep="last")
+        if len(existing_plan) < _before:
+            st.info(f"{_before - len(existing_plan)} superseded row(s) hidden — showing the most "
+                    "recent import for each channel and month. Use 'Clear this plan year' below "
+                    "if you want to start clean.")
+
+    if not existing_plan.empty:
+        # show the year alongside the month so Jan 2026 and Jan 2027 are distinguishable --
+        # "01" on its own made two different years look like duplicate rows
+        existing_plan = existing_plan.copy()
+        existing_plan["period"] = existing_plan["plan_year"].astype(str) + "-" + \
+            existing_plan["month"].astype(str).str.zfill(2)
+    edit_base = existing_plan[["channel", "product", "period", "month", "planned_dollars", "planned_kg", "note"]] \
+        if not existing_plan.empty else pd.DataFrame(columns=["channel", "product", "period", "month", "planned_dollars", "planned_kg", "note"])
+
+    if st.button("Clear this plan year and start over", key="clear_plan_year"):
+        conn.execute("DELETE FROM sales_plan WHERE plan_year = ?", (plan_year,))
+        conn.commit()
+        st.warning(f"Cleared all plan rows for {plan_year}.")
+        st.rerun()
 
     # flag rows that would be silently dropped on save, and rows imported without an item --
     # a wide-template import fills product with "(all)", which is fine, but a blank channel or

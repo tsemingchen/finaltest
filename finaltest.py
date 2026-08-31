@@ -2094,9 +2094,9 @@ else:
 # ===================================================================
 # TABS
 # ===================================================================
-tab_dash, tab_data, tab_rates, tab_forecast, tab_salesplan, tab_pipeline, tab_ops, tab_signoff, tab_ai, tab_history = st.tabs(
+tab_dash, tab_data, tab_rates, tab_forecast, tab_salesplan, tab_pipeline, tab_ops, tab_signoff, tab_history = st.tabs(
     ["Dashboard", "1. Upload sales data", "2. Computed rates", "3. Forecast (auto)",
-     "4. Sales plan (S&OP)", "5. Adjust the forecast", "6. Ops capacity check", "7. Sign-off", "8. Ask AI", "9. History"]
+     "4. Sales plan (S&OP)", "5. Adjust the forecast", "6. Ops capacity check", "7. Sign-off", "8. History"]
 )
 
 # --- DASHBOARD (landing page) ---
@@ -4230,7 +4230,14 @@ with tab_salesplan:
         conn.execute("DELETE FROM sales_plan WHERE plan_year = ?", (plan_year,))
         conn.commit()
         if not edited_clean.empty:
-            insert_dataframe("sales_plan", edited_clean)
+            # Keep only columns that actually exist in the table. The editor carries
+            # display-only columns (a combined year-month label, and any helper column added
+            # during rate conversion), and passing one of those to an INSERT fails with an
+            # unhelpful "undefined column" error. Filtering against the real schema means a
+            # new display column can never break saving again.
+            _cols = pd.read_sql("SELECT * FROM sales_plan LIMIT 0", conn).columns.tolist()
+            _keep = [col for col in edited_clean.columns if col in _cols and col != "id"]
+            insert_dataframe("sales_plan", edited_clean[_keep])
         st.success(f"Plan for {plan_year} updated ({len(edited_clean)} rows).")
         st.rerun()
 
@@ -4749,112 +4756,77 @@ with tab_signoff:
     st.dataframe(signoffs, use_container_width=True)
 
 # --- TAB: Ask AI ---
-with tab_ai:
-    st.subheader("Ask AI about the current forecast")
-    st.caption(
-        "Ask questions grounded in this cycle's real data — the current forecast, capacity status, "
-        "pipeline events, and recent accuracy. Costs a fraction of a cent per question."
-    )
-
-    api_key_set = hasattr(st, "secrets") and bool(st.secrets.get("ANTHROPIC_API_KEY"))
-    if not api_key_set:
-        st.warning("No API key set up yet.")
-        with st.expander("How to set this up (one-time, ~2 minutes)"):
-            st.markdown("""
-1. Get an API key from **console.anthropic.com** (separate from a claude.ai login — this is API access, billed per use).
-2. In Streamlit Community Cloud, open this app's settings → **Secrets**.
-3. Add:
-```
-ANTHROPIC_API_KEY = "sk-ant-...your-key-here..."
-```
-4. Save. The app picks it up automatically, no redeploy needed.
-
-The key is never visible in the code or GitHub repo — Streamlit's secrets storage keeps it separate.
-            """)
+with tab_history:
+    st.subheader("Business summary")
+    if not has_data:
+        st.info("Upload sales data to see the business summary.")
     else:
-        def build_context_summary():
-            parts = [f"Planning cycle: {cycle}"]
-            if not forecast_by_cp.empty:
-                parts.append("Current forecast by channel/item (kg):\n" +
-                              forecast_by_cp.to_string(index=False))
-            if not dollar_by_cp.empty:
-                parts.append("Translated forecast value (kg and CAD):\n" +
-                              dollar_by_cp.to_string(index=False))
-            cap_row_ai = pd.read_sql("SELECT * FROM ops_capacity WHERE cycle_label = ? ORDER BY id DESC LIMIT 1",
-                                      conn, params=(cycle,))
-            if not cap_row_ai.empty:
-                parts.append(f"Ops capacity this cycle: {cap_row_ai.iloc[0]['monthly_capacity_kg']:,.0f} kg/month")
-            if not applicable.empty:
-                parts.append("Active pipeline events this cycle:\n" +
-                              applicable[["event_type", "customer", "channel", "product",
-                                          "expected_kg_per_month"]].to_string(index=False))
-            if not backtest_df.empty:
-                recent_summary = []
-                for key, grp in backtest_df.groupby(["channel", "product"]):
-                    bias = grp.sort_values("week_start")["variance_pct"].tail(4).mean()
-                    if pd.notna(bias):
-                        recent_summary.append(f"{key[0]} / {key[1]}: recent bias {bias*100:+.0f}%")
-                parts.append("Recent forecast accuracy by segment:\n" + "\n".join(recent_summary[:30]))
-            return "\n\n".join(parts)
+        _h = sales_df.copy()
+        _h["record_date"] = pd.to_datetime(_h["record_date"], errors="coerce")
+        _h = _h.dropna(subset=["record_date"])
+        _win = st.radio("Period", ["Last 90 days", "Last 12 months", "All history"],
+                        horizontal=True, key="hist_win")
+        if _win != "All history" and not _h.empty:
+            _days = 90 if _win.startswith("Last 90") else 365
+            _h = _h[_h["record_date"] >= _h["record_date"].max() - pd.Timedelta(days=_days)]
+        _unit = st.radio("Measure by", ["Volume (kg)", "Revenue ($)"], horizontal=True, key="hist_unit")
+        _col = "kg" if _unit.startswith("Volume") else "revenue"
+        _fmt = "{:,.0f} kg" if _col == "kg" else "${:,.0f}"
 
-        question = st.text_area("Your question", placeholder="e.g. Which segments should I be worried about this week, and why?")
-        if st.button("Ask", type="primary") and question:
-            with st.spinner("Asking..."):
-                context = build_context_summary()
-                prompt = (f"You are helping analyze a coffee roaster's demand planning data. "
-                          f"Here is the current state:\n\n{context}\n\n"
-                          f"Question: {question}\n\n"
-                          f"Answer directly and specifically using the numbers above. If the data doesn't "
-                          f"contain what's needed to answer, say so rather than guessing.")
-                answer, err = call_claude(prompt)
-                if err:
-                    st.error(err)
-                else:
-                    st.markdown(answer)
+        if _h.empty:
+            st.info("No records in that period.")
+        else:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric(f"Total {'kg' if _col=='kg' else 'revenue'}", _fmt.format(_h[_col].sum()))
+            k2.metric("Distinct items", f"{_h['product'].nunique():,}")
+            k3.metric("Channels", f"{_h['channel'].nunique():,}")
+            _ncust = _h.loc[_h["customer"] != "(not tracked)", "customer"].nunique() \
+                if "customer" in _h.columns else 0
+            k4.metric("Customers", f"{_ncust:,}" if _ncust else "not tracked")
+
+            def _bar(df, dim, title, n=10):
+                g = df.groupby(dim, as_index=False)[_col].sum().sort_values(_col, ascending=True).tail(n)
+                if g.empty:
+                    return
+                _tot = df[_col].sum()
+                g["_share"] = g[_col] / _tot * 100 if _tot else 0
+                fig = go.Figure(go.Bar(
+                    x=g[_col], y=g[dim].astype(str), orientation="h", marker_color="#2F6F6B",
+                    text=[f"{v:,.0f} ({s:.0f}%)" for v, s in zip(g[_col], g["_share"])],
+                    textposition="auto"))
+                fig.update_layout(height=max(240, 30 * len(g)), margin=dict(l=10, r=10, t=40, b=10),
+                                   plot_bgcolor="white", title=title,
+                                   xaxis_title=f"{'kg sold' if _col=='kg' else 'revenue ($)'} — {_win.lower()}",
+                                   xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"))
+                st.plotly_chart(fig, use_container_width=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                _bar(_h, "product", "Top 10 items", 10)
+                _bar(_h, "channel", "By channel", 10)
+            with c2:
+                if _ncust:
+                    _bar(_h[_h["customer"] != "(not tracked)"], "customer", "Top 5 customers", 5)
+                if "size_label" in _h.columns:
+                    _bar(_h, "size_label", "By bag size", 10)
+
+            if "product_type" in _h.columns:
+                _mix = _h.groupby("product_type", as_index=False)[_col].sum()
+                _mix["share"] = (_mix[_col] / _mix[_col].sum() * 100).round(1)
+                st.markdown("**Staple vs Single mix**")
+                st.dataframe(_mix.rename(columns={
+                    "product_type": "Type", _col: f"Total {'kg' if _col=='kg' else '$'}",
+                    "share": "% of total"}), use_container_width=True, hide_index=True)
+
+            # concentration -- a real risk signal for stakeholders
+            _top = _h.groupby("product", as_index=False)[_col].sum().sort_values(_col, ascending=False)
+            if len(_top) >= 5:
+                _c5 = _top.head(5)[_col].sum() / _top[_col].sum() * 100
+                st.caption(f"Top 5 items account for **{_c5:.0f}%** of "
+                           f"{'volume' if _col=='kg' else 'revenue'} in this period — "
+                           "a useful concentration check when planning supply.")
 
     st.divider()
-    st.subheader("Suggest a change to this app")
-    st.caption(
-        "Describe a change you'd like — this drafts a suggested code edit for you to review and apply "
-        "yourself. Nothing is changed automatically; this never touches the live app or your GitHub repo."
-    )
-
-    if not api_key_set:
-        st.info("Set up the API key above first.")
-    else:
-        change_request = st.text_area(
-            "What would you like changed?",
-            placeholder="e.g. Change the ALERT threshold from 15% to 20%, or add a filter for size on the Dashboard.")
-        if st.button("Draft a suggestion") and change_request:
-            with st.spinner("Reading the app and drafting a suggestion..."):
-                try:
-                    with open(__file__, "r") as f:
-                        current_source = f.read()
-                except Exception as e:
-                    current_source = None
-                    st.error(f"Couldn't read the app's own source: {e}")
-
-                if current_source:
-                    prompt = (
-                        "You are helping a non-expert Streamlit developer modify their own app. "
-                        "Below is the FULL current source code of their app.py. A user wants a specific change. "
-                        "Suggest the exact, minimal code edit needed: show the exact snippet to find, and what "
-                        "to replace it with. Keep the diff as small as possible. Briefly explain what it does "
-                        "and flag anything risky (e.g. if it affects the database schema or other tabs). "
-                        "Do not suggest unrelated changes.\n\n"
-                        f"=== CURRENT app.py ===\n{current_source}\n=== END app.py ===\n\n"
-                        f"Requested change: {change_request}"
-                    )
-                    answer, err = call_claude(prompt, max_tokens=2000)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.markdown(answer)
-                        st.warning("This is a suggestion only — copy the relevant part into your own editor, "
-                                   "test it, then upload to GitHub to redeploy. Nothing here has been applied.")
-
-# --- TAB 6: History ---
-with tab_history:
     st.subheader("Backup / export everything")
     st.markdown("**Sales records**")
     # show a capped preview, and make the full CSV opt-in. st.download_button computes its

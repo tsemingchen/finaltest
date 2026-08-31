@@ -4262,9 +4262,52 @@ with tab_salesplan:
         elif _has_dollars and _has_kg:
             _plan_unit = st.radio("Compare the plan in:", ["kg", "dollars"], horizontal=True, key="recon_unit")
 
+    _plan_src = existing_plan.copy() if not existing_plan.empty else pd.DataFrame()
+
+    # Drop the "(total)" row when individual channels are also present. Importing both the
+    # Total row AND the channel rows counts every dollar twice -- which is why the plan showed
+    # roughly double the template's real monthly figure.
+    if not _plan_src.empty and "channel" in _plan_src.columns:
+        _has_channels = (_plan_src["channel"] != "(total)").any()
+        _has_total = (_plan_src["channel"] == "(total)").any()
+        if _has_channels and _has_total:
+            _plan_src = _plan_src[_plan_src["channel"] != "(total)"]
+            st.info("Both a company Total row and individual channel rows were imported. Using the "
+                    "channel rows and ignoring the Total, so nothing is counted twice.")
+
+    # Let the user compare in kg even when the plan is in dollars, by converting through the
+    # real computed rate. Without this a revenue plan can never be compared against volume.
+    _plan_unit_choice = _plan_unit
+    _converted_note = ""
+    if _plan_unit == "dollars" and not price_df.empty:
+        _plan_unit_choice = st.radio(
+            "Compare in:", ["dollars (as planned)", "kg (converted from $)"], horizontal=True,
+            key="recon_convert",
+            help="Your plan is in revenue. Converting to kg uses the volume-weighted rate from "
+                 "tab 2, so you can compare against actual kg and drive supply decisions.")
+        if _plan_unit_choice.startswith("kg"):
+            _wk = float(sales_df["kg"].sum()) if has_data else 0
+            _wr = float(sales_df["revenue"].sum()) if has_data else 0
+            _rate = (_wr / _wk) if _wk > 0 else None
+            if _rate:
+                _plan_src = _plan_src.copy()
+                _plan_src["planned_kg"] = _plan_src["planned_dollars"] / _rate
+                _plan_unit = "kg"
+                _converted_note = f" — converted from $ at ${_rate:,.2f}/kg (your blended actual rate)"
+            else:
+                st.warning("Can't convert to kg — no revenue/kg history to derive a rate from.")
+
     _plan_col = "planned_kg" if _plan_unit == "kg" else "planned_dollars"
-    plan_monthly = existing_plan.groupby("month", as_index=False)[_plan_col].sum() \
-        .rename(columns={_plan_col: "planned_kg"}) if not existing_plan.empty else pd.DataFrame()
+
+    # Key the plan on YYYY-MM, not a bare month number. Real bug: the plan stored month as
+    # "01" while actuals are keyed "2026-01", so the merge never matched and every Reality
+    # cell came back blank.
+    if not _plan_src.empty:
+        _plan_src = _plan_src.copy()
+        _plan_src["month_key"] = _plan_src["plan_year"].astype(str) + "-" + \
+            _plan_src["month"].astype(str).str.zfill(2)
+    plan_monthly = _plan_src.groupby("month_key", as_index=False)[_plan_col].sum() \
+        .rename(columns={_plan_col: "planned_kg", "month_key": "month"}) if not _plan_src.empty else pd.DataFrame()
     if not plan_monthly.empty:
         plan_monthly = plan_monthly[plan_monthly["planned_kg"].notna() & (plan_monthly["planned_kg"] != 0)]
 
@@ -4275,7 +4318,7 @@ with tab_salesplan:
     elif not has_data:
         st.info("Upload sales history in tab 1 to compare the plan against.")
     else:
-        st.caption(f"Comparing in **{_unit_label}** — matching how the plan was entered.")
+        st.caption(f"Comparing in **{_unit_label}**{_converted_note}.")
         actuals_monthly = sales_df.copy()
         actuals_monthly["record_date"] = pd.to_datetime(actuals_monthly["record_date"], errors="coerce")
         actuals_monthly["month"] = actuals_monthly["record_date"].dt.to_period("M").astype(str)
@@ -4326,8 +4369,13 @@ with tab_salesplan:
         recon["Gap vs plan (kg)"] = recon["Reality (kg)"] - recon["planned_kg"]
         recon["Gap %"] = np.where(recon["planned_kg"] != 0, recon["Gap vs plan (kg)"] / recon["planned_kg"] * 100, np.nan)
 
-        display_recon = recon.rename(columns={"month": "Month", "planned_kg": "Plan (kg)"})[
-            ["Month", "Plan (kg)", "Reality (kg)", "Gap vs plan (kg)", "Gap %", "Status"]].round(1)
+        # label the columns with the unit actually being compared -- they previously always
+        # said "kg" even when the comparison was in dollars, which is quietly misleading
+        _u = _unit_label
+        display_recon = recon.rename(columns={
+            "month": "Month", "planned_kg": f"Plan ({_u})",
+            "Reality (kg)": f"Reality ({_u})", "Gap vs plan (kg)": f"Gap vs plan ({_u})"})[
+            ["Month", f"Plan ({_u})", f"Reality ({_u})", f"Gap vs plan ({_u})", "Gap %", "Status"]].round(1)
         st.dataframe(display_recon, use_container_width=True, hide_index=True)
 
         fig_recon = go.Figure()

@@ -4334,7 +4334,12 @@ with tab_salesplan:
             company_monthly = sales_df.copy()
             company_monthly["record_date"] = pd.to_datetime(company_monthly["record_date"], errors="coerce")
             company_monthly["month"] = company_monthly["record_date"].dt.to_period("M").astype(str)
-            company_monthly_agg = company_monthly.groupby("month", as_index=False)["kg"].sum().sort_values("month")
+            # project in the SAME unit the comparison is using. Real bug: this always
+            # projected kg, so when comparing in dollars the line switched from ~1,300,000
+            # (revenue actuals) to ~30,000 (kg projection) the moment actuals ran out --
+            # which looked like demand collapsing to nothing.
+            company_monthly_agg = company_monthly.groupby("month", as_index=False)[_acol].sum() \
+                .rename(columns={_acol: "kg"}).sort_values("month")
             # same partial-month exclusion as the dashboard -- projecting the rest of the year
             # from a month that only has one week of data produces a wildly wrong plan
             # comparison, which is worse than no comparison
@@ -4364,6 +4369,19 @@ with tab_salesplan:
                 proj_lookup = dict(zip(proj_months, proj_recon["forecast_kg"]))
                 recon["demand_sensing_kg"] = recon["month"].map(proj_lookup)
 
+                # Also fill in what the system WOULD have forecast for months that already
+                # happened, using only the data available before each one. Without this the
+                # system line only exists in the future, so you can never check it against
+                # actuals -- which is the one comparison that tells you if the model is any good.
+                _hist = company_monthly_agg.reset_index(drop=True)
+                _back = {}
+                for _i in range(2, len(_hist)):
+                    _f = trend_forecast(_hist["kg"].iloc[:_i].tolist())
+                    if _f is not None:
+                        _back[_hist["month"].iloc[_i]] = _f
+                recon["demand_sensing_kg"] = recon["demand_sensing_kg"].fillna(
+                    recon["month"].map(_back))
+
         recon["Status"] = np.where(recon["actual_kg"].notna(), "Actual", "Forecast (projected)")
         recon["Reality (kg)"] = recon["actual_kg"].fillna(recon["demand_sensing_kg"])
         recon["Gap vs plan (kg)"] = recon["Reality (kg)"] - recon["planned_kg"]
@@ -4378,14 +4396,38 @@ with tab_salesplan:
             ["Month", f"Plan ({_u})", f"Reality ({_u})", f"Gap vs plan ({_u})", "Gap %", "Status"]].round(1)
         st.dataframe(display_recon, use_container_width=True, hide_index=True)
 
+        # Three separate lines rather than two. Previously actuals and the system's forecast
+        # were merged into one "Actual / demand-sensing" series, so you couldn't see where
+        # real data ended and prediction began, or compare the plan against the system's own
+        # view for months that have already happened.
         fig_recon = go.Figure()
-        fig_recon.add_trace(go.Scatter(x=recon["month"], y=recon["planned_kg"], mode="lines+markers",
-                                        name="Sales plan", line=dict(color="rgb(217,119,6)", width=2)))
-        fig_recon.add_trace(go.Scatter(x=recon["month"], y=recon["Reality (kg)"], mode="lines+markers",
-                                        name="Actual / demand-sensing", line=dict(color="rgb(31,119,180)", width=2)))
-        fig_recon.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
-                                 yaxis_title="kg", hovermode="x unified")
+        fig_recon.add_trace(go.Scatter(
+            x=recon["month"], y=recon["planned_kg"], mode="lines+markers",
+            name="Sales plan (what we said we'd do)",
+            line=dict(color="rgb(217,119,6)", width=2)))
+        fig_recon.add_trace(go.Scatter(
+            x=recon["month"], y=recon["actual_kg"], mode="lines+markers",
+            name="Actual (what really happened)",
+            line=dict(color="rgb(31,119,180)", width=3),
+            connectgaps=False))
+        if "demand_sensing_kg" in recon.columns and recon["demand_sensing_kg"].notna().any():
+            fig_recon.add_trace(go.Scatter(
+                x=recon["month"], y=recon["demand_sensing_kg"], mode="lines+markers",
+                name="System forecast (what the data predicts)",
+                line=dict(color="#555", width=2, dash="dash"),
+                connectgaps=False))
+        fig_recon.update_layout(height=380, margin=dict(l=10, r=10, t=46, b=10), plot_bgcolor="white",
+                                 yaxis_title=_unit_label, hovermode="x unified",
+                                 yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                                 legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                             xanchor="left", x=0))
         st.plotly_chart(fig_recon, use_container_width=True)
+        st.caption(
+            "**Plan vs Actual** for months that have happened tells you how well Sales planned. "
+            "**Plan vs System forecast** for months ahead tells you whether the plan still looks "
+            "achievable. **Actual vs System forecast** on past months is the accuracy check on the "
+            f"model itself. All three are in {_unit_label}."
+        )
 
 # --- TAB: Pipeline / known events ---
 with tab_pipeline:

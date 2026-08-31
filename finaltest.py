@@ -2317,11 +2317,14 @@ with tab_dash:
                        "Check that the Channel and Item spelling matches your sales data exactly — "
                        "the Pipeline tab has a before/after table that shows whether each event is landing.")
 
-        st.caption("Solid blue line is **actual** historical sales, whole company. Dashed line (Week view "
-                   "only) is what the auto-forecast would have predicted for each of the last 12 weeks, "
-                   "checked against what actually happened — a real accuracy check, not a future prediction. "
-                   "Tick the box below to also see the forecast projected forward, with a range built from "
-                   "this model's own real historical accuracy.")
+        st.caption(
+            "**Blue** is actual sales for the whole company. **Brown** is the same forecast model "
+            "shown over two periods: *dashed* to the left of the divider is what it would have "
+            "predicted for weeks that have already happened (an accuracy check against reality), "
+            "and *solid* to the right is the projection ahead, with a shaded range built from this "
+            "model's own historical accuracy. Where the dashed brown line sits close to the blue "
+            "line, the model has been forecasting well."
+        )
         trend_freq = st.radio("Show by", ["Week", "Month"], horizontal=True, key="trend_freq")
         d_trend = sales_df.copy()
         d_trend["record_date"] = pd.to_datetime(d_trend["record_date"], errors="coerce")
@@ -2386,7 +2389,7 @@ with tab_dash:
         if trend_freq == "Week" and not total_bt.empty:
             bt_recent = total_bt.sort_values("week_start").tail(12)
             fig_trend.add_trace(go.Scatter(x=bt_recent["week_start"], y=bt_recent["forecast_kg"], mode="lines",
-                                            name="Auto forecast (backtested)",
+                                            name="Forecast — checked against actuals (past)",
                                             line=dict(color="rgb(139,90,60)", width=2, dash="dash")))
         if not projection.empty:
             last_date = pd.Timestamp(trend_agg["period"].iloc[-1])
@@ -2403,8 +2406,13 @@ with tab_dash:
             fig_trend.add_trace(go.Scatter(x=join_x, y=join_y_low, mode="lines", line=dict(width=0),
                                             fill="tonexty", fillcolor="rgba(120,120,120,0.25)", name="Forecast range",
                                             hoverinfo="skip"))
-            fig_trend.add_trace(go.Scatter(x=join_x, y=join_y_mid, mode="lines", name="Forecast",
-                                            line=dict(color="rgb(60,60,60)", width=2)))
+            fig_trend.add_trace(go.Scatter(x=join_x, y=join_y_mid, mode="lines",
+                                            name="Forecast — projected ahead (future)",
+                                            # same brown as the backtested line, solid instead of
+                                            # dashed: it's the SAME model, just past vs future.
+                                            # Two different colours made it look like two
+                                            # unrelated forecasts.
+                                            line=dict(color="#8b5a3c", width=2)))
         fig_trend.update_layout(height=460, margin=dict(l=10, r=10, t=40, b=10), plot_bgcolor="white",
                                  xaxis_title=trend_freq, yaxis_title="Total kg (all channels/items)",
                                  hovermode="x unified", xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),

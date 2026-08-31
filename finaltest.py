@@ -2109,6 +2109,10 @@ with tab_dash:
         st.warning("Not enough history yet to forecast — need at least a few weeks of data per channel/product.")
     else:
         dim_map = {"Channel": "channel", "Item": "product", "Customer": "customer"}
+        # Staple/Single is a dimension people genuinely slice by -- it's how the forecast is
+        # built, so being unable to filter or group by it here was an odd gap.
+        if "product_type" in sales_df.columns and sales_df["product_type"].nunique() > 1:
+            dim_map["Staple / Single"] = "product_type"
 
         # ===============================================================
         # OVERVIEW — always whole-company, never filtered. KPIs + one chart.
@@ -2655,13 +2659,21 @@ with tab_dash:
         # STAPLE — CHANNEL & BAG SIZE, 3 MONTHS AHEAD (for Operations' bag ordering)
         # ===============================================================
         if "size_label" in sales_df.columns:
-            st.markdown("## Bag ordering — every channel & size, 3 months ahead")
+            st.markdown("## Bag ordering — every channel & size")
             st.caption(
                 "Everything Operations needs to place a bag order: all three segments (Single and both "
-                "Staple segments), every channel, every bag size, three months out for lead time. Each "
-                "segment is projected on its own history, then split by trending channel share and bag-size "
-                "share, and converted to real bag counts using the kg-per-bag rate learned from your sales."
+                "Staple segments), every channel, every bag size. Each segment is projected on its own "
+                "history, then split by trending channel share and bag-size share, and converted to real "
+                "bag counts using the kg-per-bag rate learned from your sales."
             )
+            _bag_c1, _bag_c2 = st.columns([1, 2])
+            with _bag_c1:
+                _bag_freq = st.radio("Horizon", ["Monthly (3 months)", "Weekly (8 weeks)"],
+                                      key="bag_freq",
+                                      help="Monthly suits ordering with a long lead time. Weekly is more "
+                                           "useful for near-term packaging runs and checking whether a "
+                                           "size is about to run short.")
+            _bag_is_month = _bag_freq.startswith("Monthly")
             if st.button("Compute bag order breakdown", key="compute_staple_breakdown"):
                 st.session_state["show_staple_breakdown"] = True
 
@@ -2676,11 +2688,18 @@ with tab_dash:
                         _adj_weekly = type_level_forecasts_with_pipeline.get(_lab, _base) - _base
                         if abs(_adj_weekly) > 0.01:
                             _seg_adjust[_lab] = _adj_weekly * 4.345
+                # events/overrides are stored monthly, so scale them to the period being shown
+                if not _bag_is_month:
+                    _seg_adjust = {k: v / 4.345 for k, v in _seg_adjust.items()}
                 if _seg_adjust:
+                    _u = "kg/mo" if _bag_is_month else "kg/wk"
                     st.info("This breakdown includes your logged events and manual overrides: "
-                            + ", ".join(f"{k} {v:+,.0f} kg/mo" for k, v in _seg_adjust.items()))
+                            + ", ".join(f"{k} {v:+,.0f} {_u}" for k, v in _seg_adjust.items()))
                 breakdown_df = compute_all_channel_bag_breakdown(
-                    sales_df, n_periods=3, freq="M", segment_adjust=_seg_adjust)
+                    sales_df,
+                    n_periods=3 if _bag_is_month else 8,
+                    freq="M" if _bag_is_month else "W",
+                    segment_adjust=_seg_adjust)
                 if breakdown_df.empty:
                     st.info("Not enough history yet for this breakdown.")
                 else:
@@ -2712,7 +2731,7 @@ with tab_dash:
         st.caption("'Not included' aggregates across every value of that dimension (e.g. item totals combined "
                    "across all channels). 'All' breaks that dimension down into every value (rows in tables, "
                    "bars in charts). Pick one specific value to narrow everything below to just that segment.")
-        fc1, fc2, fc3 = st.columns(3)
+        fc1, fc2, fc3, fc4 = st.columns(4)
         channel_options = ["(not included)", "All"] + sorted(sales_df["channel"].unique().tolist())
         item_options = ["(not included)", "All"] + sorted(sales_df["product"].unique().tolist())
         customer_available = "customer" in sales_df.columns and not (sales_df["customer"] == "(not tracked)").all()
@@ -2728,6 +2747,16 @@ with tab_dash:
         if not customer_available:
             fc3.caption("Not available in this data source.")
 
+        _type_available = "product_type" in sales_df.columns and sales_df["product_type"].nunique() > 1
+        _type_options = ["(not included)", "All"] + sorted(
+            sales_df["product_type"].dropna().unique().tolist()) if _type_available else ["(not included)"]
+        sel_type = fc4.selectbox("Staple / Single", _type_options, key="filt_type",
+                                  disabled=not _type_available,
+                                  help="Slice the forecast by product type — the same split the "
+                                       "forecast itself is built on.")
+        if not _type_available:
+            fc4.caption("Not available in this data source.")
+
         group_cols = []
         filter_values = {}
         if sel_channel == "All":
@@ -2742,6 +2771,10 @@ with tab_dash:
             group_cols.append("customer")
         elif sel_customer not in ("(not included)",):
             filter_values["customer"] = sel_customer
+        if sel_type == "All":
+            group_cols.append("product_type")
+        elif sel_type not in ("(not included)",):
+            filter_values["product_type"] = sel_type
 
         filtered_df = sales_df.copy()
         for col, val in filter_values.items():

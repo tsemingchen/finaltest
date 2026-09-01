@@ -2796,9 +2796,13 @@ with tab_dash:
                         else:
                             st.caption("Everything else, including those same coffees in other sizes — "
                                        "labelled in-house, so only the blank stock has a lead time.")
+                        # Supplier bags are pre-printed per coffee, so the order has to name the
+                        # item. Roastery bags are blank stock -- only the size is ordered, so
+                        # breaking them out by item would just be noise on the purchase order.
+                        _idx = ["product", "size_label"] if _seg_name.startswith("Bag supplier") \
+                            else ["size_label"]
                         _t = _part.dropna(subset=[value_col]).pivot_table(
-                            index=["product", "size_label"], columns="period",
-                            values=value_col, aggfunc="sum").round(0)
+                            index=_idx, columns="period", values=value_col, aggfunc="sum").round(0)
                         st.dataframe(_t, use_container_width=True)
                         _sum_kg = _part["forecast_kg"].sum()
                         _sum_bags = _part["forecast_bags"].sum() if has_bags else None

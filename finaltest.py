@@ -25,6 +25,7 @@ without needing an account -- that fallback is NOT durable on Streamlit Cloud.
 
 import sqlite3
 import io
+import re
 from datetime import datetime, date, timedelta
 
 import numpy as np
@@ -187,6 +188,10 @@ def get_conn():
         product_type TEXT, freq TEXT, order_p INTEGER, order_d INTEGER, order_q INTEGER,
         seasonal_p INTEGER, seasonal_d INTEGER, seasonal_q INTEGER, seasonal_m INTEGER,
         found_at TEXT
+    )""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS item_groups (
+        {id_col},
+        item_id TEXT, item_group TEXT, updated_at TEXT
     )""")
     conn.execute(f"""CREATE TABLE IF NOT EXISTS upload_column_defaults (
         {id_col},
@@ -600,6 +605,48 @@ def apply_overrides_to_segments(sales_df, segment_forecasts, active_overrides, f
                 "segment_change_kg": round(delta, 1),
             })
     return adjusted, notes
+
+
+# Groups whose 12oz bags are pre-printed by the bag supplier. Every other bag -- including
+# these same groups in 5oz / 2.5lb / other sizes -- is labelled in-house at the roastery.
+# Splitting the order this way matters because the two go to different places on different
+# lead times, so a single combined list can't be actioned by either team.
+SUPPLIER_LABELLED_GROUPS = {"OSEE", "EE", "OBR", "OESP", "OFR"}
+SUPPLIER_LABELLED_SIZE_HINT = "12"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_item_groups():
+    """Item ID -> coffee group (e.g. OSEE12 and OSEE5 both map to OSEE). Green coffee is
+    bought by group, not by finished-goods size, so the green bean view needs this."""
+    try:
+        df = pd.read_sql("SELECT item_id, item_group FROM item_groups", conn)
+        if df.empty:
+            return {}
+        return dict(zip(df["item_id"].astype(str).str.strip().str.upper(),
+                        df["item_group"].astype(str).str.strip().str.upper()))
+    except Exception:
+        return {}
+
+
+def map_to_group(product, group_map):
+    """Resolves an item to its coffee group. Falls back to stripping the trailing size from
+    the item code (OSEE12 -> OSEE) when the item isn't in the uploaded mapping, so a new SKU
+    still lands in the right group instead of vanishing from the green bean view."""
+    p = str(product).strip().upper()
+    if p in group_map:
+        return group_map[p]
+    _stripped = re.sub(r"(12X3|2\.5LB|2\.5|12|5|2)$", "", p)
+    return _stripped if _stripped else p
+
+
+def is_supplier_labelled(product, size_label, group_map):
+    """True when the bag is pre-printed by the supplier: one of the named groups AND a 12oz
+    bag. Everything else is labelled at the roastery."""
+    grp = map_to_group(product, group_map)
+    if grp not in SUPPLIER_LABELLED_GROUPS:
+        return False
+    return SUPPLIER_LABELLED_SIZE_HINT in str(size_label)
 
 
 def load_known_classifications():
@@ -1127,9 +1174,25 @@ def compute_all_channel_bag_breakdown(sales_df, n_periods=3, freq="M", segment_a
             for _, chrow in ch_shares.iterrows():
                 ch_kg = seg_total * chrow["share"]
                 for _, srow in size_by_ch.get(chrow["channel"], pd.DataFrame()).iterrows():
-                    rows.append({"segment": label, "channel": chrow["channel"],
-                                 "size_label": srow["size_label"], "period": period_label,
-                                 "forecast_kg": ch_kg * srow["share"]})
+                    _cell_kg = ch_kg * srow["share"]
+                    # split down to ITEM level as well. Operations orders bags per item code,
+                    # not per channel -- a channel/size total can't be turned into a purchase
+                    # order without knowing which coffees make it up.
+                    _cs = seg_df[(seg_df["channel"] == chrow["channel"]) &
+                                 (seg_df["size_label"].astype(str) == str(srow["size_label"]))]
+                    _items = _cs.groupby("product", as_index=False)["kg"].sum() if not _cs.empty else pd.DataFrame()
+                    _tot_items = _items["kg"].sum() if not _items.empty else 0
+                    if _tot_items > 0:
+                        for _, irow in _items.iterrows():
+                            rows.append({"segment": label, "channel": chrow["channel"],
+                                         "product": irow["product"],
+                                         "size_label": srow["size_label"], "period": period_label,
+                                         "forecast_kg": _cell_kg * (irow["kg"] / _tot_items)})
+                    else:
+                        rows.append({"segment": label, "channel": chrow["channel"],
+                                     "product": "(unassigned)",
+                                     "size_label": srow["size_label"], "period": period_label,
+                                     "forecast_kg": _cell_kg})
     result = pd.DataFrame(rows)
     if result.empty:
         return result
@@ -2712,19 +2775,126 @@ with tab_dash:
                         "Show as", ["Bags (for ordering)", "Kg"], horizontal=True, key="staple_bag_unit")
                     value_col = "forecast_bags" if show_unit.startswith("Bags") else "forecast_kg"
 
-                    st.markdown("**Total bags to order, by size** — the headline number for a purchase order")
-                    totals = breakdown_df.dropna(subset=[value_col]).pivot_table(
-                        index="size_label", columns="period", values=value_col, aggfunc="sum").round(0)
-                    st.dataframe(totals, use_container_width=True)
+                    _gm = load_item_groups()
+                    _bd = breakdown_df.copy()
+                    _bd["group"] = _bd["product"].map(lambda p: map_to_group(p, _gm))
+                    _bd["label_by"] = _bd.apply(
+                        lambda r: "Bag supplier (pre-printed)"
+                        if is_supplier_labelled(r["product"], r["size_label"], _gm)
+                        else "Roastery (labelled in-house)", axis=1)
 
-                    with st.expander("By segment, channel and size"):
-                        detail = breakdown_df.dropna(subset=[value_col]).pivot_table(
-                            index=["segment", "channel", "size_label"], columns="period",
+                    _per = "month" if _bag_is_month else "week"
+                    for _seg_name in ["Bag supplier (pre-printed)", "Roastery (labelled in-house)"]:
+                        _part = _bd[_bd["label_by"] == _seg_name]
+                        if _part.empty:
+                            continue
+                        st.markdown(f"### {_seg_name}")
+                        if _seg_name.startswith("Bag supplier"):
+                            st.caption("12oz bags for " + ", ".join(sorted(SUPPLIER_LABELLED_GROUPS))
+                                       + " — these arrive pre-printed, so they need ordering on the "
+                                         "supplier's lead time.")
+                        else:
+                            st.caption("Everything else, including those same coffees in other sizes — "
+                                       "labelled in-house, so only the blank stock has a lead time.")
+                        _t = _part.dropna(subset=[value_col]).pivot_table(
+                            index=["product", "size_label"], columns="period",
                             values=value_col, aggfunc="sum").round(0)
-                        st.dataframe(detail, use_container_width=True)
+                        st.dataframe(_t, use_container_width=True)
+                        _sum_kg = _part["forecast_kg"].sum()
+                        _sum_bags = _part["forecast_bags"].sum() if has_bags else None
+                        st.caption(
+                            f"Total across the horizon: {_sum_kg:,.0f} kg"
+                            + (f" · {_sum_bags:,.0f} bags" if _sum_bags == _sum_bags and _sum_bags else "")
+                            + f" · shown per {_per}.")
+
+                    with st.expander("Item / size / qty / kg detail"):
+                        _det = _bd.copy()
+                        _det["forecast_kg"] = _det["forecast_kg"].round(1)
+                        _cols = ["label_by", "group", "product", "size_label", "period",
+                                 "forecast_kg"] + (["forecast_bags"] if has_bags else [])
+                        st.dataframe(
+                            _det[_cols].rename(columns={
+                                "label_by": "Labelled by", "group": "Coffee group",
+                                "product": "Item ID", "size_label": "Bag size",
+                                "period": _per.title(), "forecast_kg": "Forecast kg",
+                                "forecast_bags": "Qty (bags)"}),
+                            use_container_width=True, hide_index=True)
                     with st.expander("Kg-per-bag rates used (learned from your actual data)"):
                         st.dataframe(compute_kg_per_bag(sales_df), use_container_width=True, hide_index=True)
                     st.caption("Bag counts are rounded up per line — you can't order a partial bag.")
+            st.divider()
+
+        # ===============================================================
+        # GREEN BEAN — kg by coffee group, no sizes
+        # ===============================================================
+        if "product_type" in sales_df.columns:
+            st.markdown("## Green bean planning — Staple, by coffee group")
+            st.caption(
+                "Green coffee is bought by coffee, not by finished-goods size — OSEE12 and OSEE5 are "
+                "the same green bean. This rolls the Staple forecast up to group level so the green "
+                "bean team can plan purchasing directly, without translating from bag sizes."
+            )
+            _gm_gb = load_item_groups()
+            if not _gm_gb:
+                st.info("Upload an Item ID → Group mapping below to group items properly. Until then "
+                        "groups are inferred by stripping the size from the item code (OSEE12 → OSEE), "
+                        "which works for most codes but won't catch every exception.")
+            _gb_freq = st.radio("Horizon", ["Monthly (3 months)", "Weekly (8 weeks)"],
+                                 horizontal=True, key="gb_freq")
+            _gb_is_month = _gb_freq.startswith("Monthly")
+
+            if st.button("Compute green bean plan", key="compute_green_bean"):
+                st.session_state["show_green_bean"] = True
+
+            if st.session_state.get("show_green_bean"):
+                _gb = compute_all_channel_bag_breakdown(
+                    sales_df,
+                    n_periods=3 if _gb_is_month else 8,
+                    freq="M" if _gb_is_month else "W")
+                _gb = _gb[_gb["segment"].astype(str).str.startswith("Staple")] if not _gb.empty else _gb
+                if _gb.empty:
+                    st.info("Not enough Staple history yet for a green bean plan.")
+                else:
+                    _gb = _gb.copy()
+                    _gb["Coffee group"] = _gb["product"].map(lambda p: map_to_group(p, _gm_gb))
+                    _piv = _gb.pivot_table(index="Coffee group", columns="period",
+                                            values="forecast_kg", aggfunc="sum").round(0)
+                    _piv["Total kg"] = _piv.sum(axis=1).round(0)
+                    _piv = _piv.sort_values("Total kg", ascending=False)
+                    st.dataframe(_piv, use_container_width=True)
+                    st.caption(f"Roasted kg of Staple coffee per group, per "
+                               f"{'month' if _gb_is_month else 'week'}. Green coffee purchasing "
+                               "usually needs a yield allowance on top — roasting loses weight — "
+                               "so treat these as roasted-equivalent, not green kg.")
+
+            with st.expander("Item ID → Coffee group mapping"):
+                _cur = pd.read_sql("SELECT item_id, item_group FROM item_groups ORDER BY item_group, item_id", conn)
+                if not _cur.empty:
+                    st.caption(f"{len(_cur)} items mapped across {_cur['item_group'].nunique()} groups.")
+                    st.dataframe(_cur.rename(columns={"item_id": "Item ID", "item_group": "Group"}),
+                                 use_container_width=True, hide_index=True)
+                _gfile = st.file_uploader("Upload mapping (needs an Item ID column and a Group column)",
+                                           type=["csv", "xlsx", "xls"], key="group_upload")
+                if _gfile is not None:
+                    _graw = pd.read_excel(_gfile) if _gfile.name.lower().endswith((".xlsx", ".xls")) \
+                        else pd.read_csv(_gfile)
+                    _gc1, _gc2 = st.columns(2)
+                    _icol = _gc1.selectbox("Item ID column", list(_graw.columns), key="gmap_item")
+                    _grcol = _gc2.selectbox("Group column", list(_graw.columns), key="gmap_group")
+                    if st.button("Save mapping", key="save_group_map"):
+                        _clean = _graw[[_icol, _grcol]].dropna()
+                        _clean.columns = ["item_id", "item_group"]
+                        _clean["item_id"] = _clean["item_id"].astype(str).str.strip()
+                        _clean["item_group"] = _clean["item_group"].astype(str).str.strip()
+                        _clean = _clean[_clean["item_id"] != ""].drop_duplicates(subset=["item_id"], keep="last")
+                        _clean["updated_at"] = datetime.now().isoformat()
+                        conn.execute("DELETE FROM item_groups")
+                        conn.commit()
+                        insert_dataframe("item_groups", _clean)
+                        load_item_groups.clear()
+                        st.success(f"Saved {len(_clean)} item-to-group mappings.")
+                        st.rerun()
+            st.divider()
             st.divider()
 
         st.markdown("### Filter / break down by")

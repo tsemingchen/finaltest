@@ -189,6 +189,10 @@ def get_conn():
         seasonal_p INTEGER, seasonal_d INTEGER, seasonal_q INTEGER, seasonal_m INTEGER,
         found_at TEXT
     )""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS seasonal_factors (
+        {id_col},
+        month INTEGER, factor REAL, updated_at TEXT, updated_by TEXT
+    )""")
     conn.execute(f"""CREATE TABLE IF NOT EXISTS item_groups (
         {id_col},
         item_id TEXT, item_group TEXT, updated_at TEXT
@@ -613,6 +617,21 @@ def apply_overrides_to_segments(sales_df, segment_forecasts, active_overrides, f
 # lead times, so a single combined list can't be actioned by either team.
 SUPPLIER_LABELLED_GROUPS = {"OSEE", "EE", "OBR", "OESP", "OFR"}
 SUPPLIER_LABELLED_SIZE_HINT = "12"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_seasonal_factors():
+    """Month-of-year multipliers the business supplies directly (1.00 = normal, 0.80 = 20%
+    below normal). Needed because detecting yearly seasonality statistically requires two-plus
+    years of history -- with less than that the model cannot know December is quieter, no
+    matter how it's configured. This lets known business knowledge fill a gap the data can't."""
+    try:
+        df = pd.read_sql("SELECT month, factor FROM seasonal_factors", conn)
+        if df.empty:
+            return {}
+        return {int(r["month"]): float(r["factor"]) for _, r in df.iterrows()}
+    except Exception:
+        return {}
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1726,13 +1745,14 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13), min_corr=0.18):
+def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), min_corr=0.18):
     """Finds a genuine repeating cycle in the data, or returns None.
 
-    Candidates stop at 13 periods deliberately: a 52-week seasonal fit was measured at 2.5s
-    versus 0.4s for a short cycle, and with several segments plus the bag breakdown that adds
-    up on every page load. Short ordering rhythms are also what actually drives week-to-week
-    demand here; a yearly cycle needs years of clean history to estimate honestly anyway.
+    Yearly (52-week) and half-yearly (26-week) cycles are included, which only became
+    meaningful once two-plus years of history existed -- a yearly pattern needs to be observed
+    at least twice before it can be told apart from a one-off. A 52-week fit costs ~2.5s vs
+    ~0.4s for a short cycle, which is affordable across three segments but would not have been
+    across hundreds of items.
 
     A flat forward forecast means the model found no repeating structure -- only noise. The
     honest way to make a forecast move up and down is to model a cycle that's really there
@@ -2777,6 +2797,29 @@ with tab_dash:
 
                     _gm = load_item_groups()
                     _bd = breakdown_df.copy()
+
+                    # Fold multipacks into their base item. An EE12X3 is one SET containing
+                    # three EE12 bags -- the bag supplier prints and ships 3 bags, not 1 "set".
+                    # Left as its own line it showed a misleading qty of 1 and split the same
+                    # bag across two rows, so the order would be short.
+                    _mp = _bd["product"].astype(str).str.upper().str.extract(r"^(.*?)(?:X(\d+))$")
+                    _base, _mult = _mp[0], pd.to_numeric(_mp[1], errors="coerce")
+                    _ismp = _base.notna() & _mult.notna()
+                    if _ismp.any():
+                        _n_folded = int(_ismp.sum())
+                        _bd.loc[_ismp, "forecast_bags"] = (
+                            pd.to_numeric(_bd.loc[_ismp, "forecast_bags"], errors="coerce") * _mult[_ismp])
+                        _bd.loc[_ismp, "product"] = _base[_ismp]
+                        # a 3-pack of 12oz is still 12oz bags as far as the supplier is concerned
+                        _bd.loc[_ismp, "size_label"] = (
+                            _bd.loc[_ismp, "size_label"].astype(str).str.replace(
+                                r"^SET-", "", regex=True))
+                        _bd = _bd.groupby(
+                            ["segment", "channel", "product", "size_label", "period"],
+                            as_index=False).agg(forecast_kg=("forecast_kg", "sum"),
+                                                 forecast_bags=("forecast_bags", "sum"))
+                        st.caption(f"{_n_folded} multipack line(s) folded into their base item — "
+                                   "an X3 set is counted as 3 bags of that coffee, not 1 set.")
                     _bd["group"] = _bd["product"].map(lambda p: map_to_group(p, _gm))
                     _bd["label_by"] = _bd.apply(
                         lambda r: "Bag supplier (pre-printed)"
@@ -4144,7 +4187,10 @@ with tab_forecast:
                 "general-purpose configuration, ARIMA(1,1,1). Running a search tests many "
                 "configurations against your own history and keeps whichever fits best. It takes "
                 "a minute or two, so it runs only when you ask — the result is stored and reused "
-                "until you search again. Worth re-running if accuracy starts drifting."
+                "until you search again. Worth re-running if accuracy starts drifting.\n\n"
+                "**Searching only changes forecasts going forward.** The historical "
+                "forecast-vs-actual line and the accuracy figures are computed with a fixed "
+                "baseline model, so past numbers stay exactly as they were reported."
             )
             _segs = split_into_segments(sales_df) if has_data else {}
             if _segs:

@@ -2459,9 +2459,34 @@ with tab_dash:
         show_projection = st.checkbox("Also show the forecast projection", key="show_trend_projection")
         if show_projection:
             with st.spinner("Projecting the trend forward..."):
-                projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma,
-                                                        n_periods=n_periods_fwd,
-                                                        keep_trend=True)
+                # Company-level projection built by summing each segment's own searched model,
+                # rather than one generic fit on the company total. Without this the Overview
+                # chart ignored the model search entirely -- you could change every segment's
+                # model and this line would never move.
+                _seg_fwd = {}
+                for _lab, _sdf in split_into_segments(sales_df).items():
+                    _sa = aggregate_periods(_sdf, ["product_type"], "W" if trend_freq == "Week" else "M")
+                    _sa = _sa.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period")
+                    if len(_sa) < 2:
+                        continue
+                    _so = get_stored_order(_lab, "W")
+                    _sp = project_forward_with_range(
+                        _sa["actual_kg"].tolist(), None, n_periods=n_periods_fwd, keep_trend=True,
+                        order=_so[0] if _so else None,
+                        seasonal_period=(_so[1][3] if _so and _so[1][3] else None))
+                    if not _sp.empty:
+                        _seg_fwd[_lab] = _sp.reset_index(drop=True)
+                if _seg_fwd:
+                    _n = min(len(v) for v in _seg_fwd.values())
+                    projection = pd.DataFrame({
+                        "step": range(1, _n + 1),
+                        "forecast_kg": sum(v["forecast_kg"].iloc[:_n] for v in _seg_fwd.values()),
+                        "low": sum(v["low"].iloc[:_n] for v in _seg_fwd.values()),
+                        "high": sum(v["high"].iloc[:_n] for v in _seg_fwd.values()),
+                    })
+                else:
+                    projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma,
+                                                            n_periods=n_periods_fwd, keep_trend=True)
         else:
             projection = pd.DataFrame()
 
@@ -4219,6 +4244,11 @@ with tab_forecast:
                         _o, _so = search_best_order(_lab, _ser, "W")
                         _out.append(f"{_lab}: ARIMA{_o}" + (f" seasonal every {_so[3]} weeks" if _so[3] else ""))
                     _prog.empty()
+                    # Clear cached projections. reset_adjustment_state() only drops stored
+                    # accuracy results -- the forward projections are cached on their own
+                    # inputs, so without this the OLD forecast was served straight from cache
+                    # and the new model appeared to change nothing.
+                    st.cache_data.clear()
                     reset_adjustment_state()
                     st.success("Search complete — these models are now in use:\n\n" +
                                "\n\n".join(f"- {line}" for line in _out))

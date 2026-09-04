@@ -1745,8 +1745,14 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 13, 26, 52), min_corr=0.18):
+def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 12, 13, 26, 52), min_corr=0.18):
     """Finds a genuine repeating cycle in the data, or returns None.
+
+    Lag 12 matters specifically: on a MONTHLY series a yearly cycle repeats every 12 points,
+    not 52. It was missing from the candidate list, so an annual pattern in monthly data --
+    a December dip, for instance -- could never be found no matter how the model was searched.
+    Verified on a series with a genuine yearly cycle: lag 12 scored +0.56, the strongest of
+    any candidate, while the nearest tested lag (13) scored only +0.44.
 
     Yearly (52-week) and half-yearly (26-week) cycles are included, which only became
     meaningful once two-plus years of history existed -- a yearly pattern needs to be observed
@@ -2827,24 +2833,46 @@ with tab_dash:
                     # three EE12 bags -- the bag supplier prints and ships 3 bags, not 1 "set".
                     # Left as its own line it showed a misleading qty of 1 and split the same
                     # bag across two rows, so the order would be short.
-                    _mp = _bd["product"].astype(str).str.upper().str.extract(r"^(.*?)(?:X(\d+))$")
-                    _base, _mult = _mp[0], pd.to_numeric(_mp[1], errors="coerce")
-                    _ismp = _base.notna() & _mult.notna()
-                    if _ismp.any():
-                        _n_folded = int(_ismp.sum())
-                        _bd.loc[_ismp, "forecast_bags"] = (
-                            pd.to_numeric(_bd.loc[_ismp, "forecast_bags"], errors="coerce") * _mult[_ismp])
-                        _bd.loc[_ismp, "product"] = _base[_ismp]
-                        # a 3-pack of 12oz is still 12oz bags as far as the supplier is concerned
-                        _bd.loc[_ismp, "size_label"] = (
-                            _bd.loc[_ismp, "size_label"].astype(str).str.replace(
-                                r"^SET-", "", regex=True))
+                    # Multipacks are counted as the individual bags they contain, then merged
+                    # into the matching single-bag line. A set is one unit to sell but N bags
+                    # to order -- left as its own row it reported a qty of 1 and split the same
+                    # bag across two lines, so the order came up short.
+                    #
+                    # Two conventions appear in the data and both are handled:
+                    #   item code  EE12X3      -> 3 x EE12
+                    #   size label SET-12oz    -> 3 x 12oz   (no digit means 3)
+                    #              SET2-12oz   -> 2 x 12oz
+                    #              SET4-12oz   -> 4 x 12oz
+                    _bags = pd.to_numeric(_bd["forecast_bags"], errors="coerce")
+                    _folded = 0
+
+                    _pm = _bd["product"].astype(str).str.upper().str.extract(r"^(.*?)X(\d+)$")
+                    _p_ok = _pm[0].notna() & _pm[1].notna()
+                    if _p_ok.any():
+                        _bags.loc[_p_ok] = _bags.loc[_p_ok] * pd.to_numeric(_pm[1][_p_ok])
+                        _bd.loc[_p_ok, "product"] = _pm[0][_p_ok]
+                        _folded += int(_p_ok.sum())
+
+                    _sm = _bd["size_label"].astype(str).str.upper().str.extract(r"^SET(\d*)-(.+)$")
+                    _s_ok = _sm[1].notna()
+                    if _s_ok.any():
+                        _smult = pd.to_numeric(_sm[0], errors="coerce").fillna(3)
+                        _bags.loc[_s_ok] = _bags.loc[_s_ok] * _smult[_s_ok]
+                        # keep the original casing of the base size where possible
+                        _bd.loc[_s_ok, "size_label"] = (
+                            _bd.loc[_s_ok, "size_label"].astype(str)
+                            .str.replace(r"^SET\d*-", "", regex=True))
+                        _folded += int(_s_ok.sum())
+
+                    if _folded:
+                        _bd["forecast_bags"] = _bags
+                        _bd = _bd[_bd["size_label"].astype(str).str.lower() != "nan"]
                         _bd = _bd.groupby(
                             ["segment", "channel", "product", "size_label", "period"],
                             as_index=False).agg(forecast_kg=("forecast_kg", "sum"),
                                                  forecast_bags=("forecast_bags", "sum"))
-                        st.caption(f"{_n_folded} multipack line(s) folded into their base item — "
-                                   "an X3 set is counted as 3 bags of that coffee, not 1 set.")
+                        st.caption(f"{_folded} multipack line(s) counted as individual bags and merged "
+                                   "into the matching size — SET = 3 bags, SET2 = 2, SET4 = 4.")
                     _bd["group"] = _bd["product"].map(lambda p: map_to_group(p, _gm))
                     _bd["label_by"] = _bd.apply(
                         lambda r: "Bag supplier (pre-printed)"
@@ -4531,6 +4559,62 @@ with tab_salesplan:
             insert_dataframe("sales_plan", edited_clean[_keep])
         st.success(f"Plan for {plan_year} updated ({len(edited_clean)} rows).")
         st.rerun()
+
+    st.divider()
+    st.markdown("## Full sales history — is there a seasonal pattern?")
+    st.caption(
+        "Every month of actual sales you've uploaded, so you can see for yourself whether the "
+        "same months are consistently strong or weak. The forecast can only learn a yearly "
+        "pattern that genuinely repeats — this chart is how you check whether one exists."
+    )
+    if not has_data:
+        st.info("Upload sales history to see this.")
+    else:
+        _hist_all = sales_df.copy()
+        _hist_all["record_date"] = pd.to_datetime(_hist_all["record_date"], errors="coerce")
+        _hist_all = _hist_all.dropna(subset=["record_date"])
+        _hu = st.radio("Measure", ["Revenue ($)", "Volume (kg)"], horizontal=True, key="histall_unit")
+        _hc = "revenue" if _hu.startswith("Revenue") else "kg"
+        _hist_all["month"] = _hist_all["record_date"].dt.to_period("M").astype(str)
+        # exclude the in-progress month -- a part month reads as a collapse
+        _hl = _hist_all["record_date"].max()
+        _ha = _hist_all.groupby("month", as_index=False)[_hc].sum().sort_values("month")
+        if pd.notna(_hl) and _hl < _hl.to_period("M").to_timestamp("M"):
+            _ha = _ha[_ha["month"] != str(_hl.to_period("M"))]
+
+        if len(_ha) >= 2:
+            _fh = go.Figure(go.Scatter(x=_ha["month"], y=_ha[_hc], mode="lines+markers",
+                                        name="Actual", line=dict(color="#1f77b4", width=2)))
+            _fh.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10), plot_bgcolor="white",
+                               yaxis_title=("$" if _hc == "revenue" else "kg"), xaxis_title="Month",
+                               yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"))
+            st.plotly_chart(_fh, use_container_width=True)
+
+            # same month across years, side by side -- the clearest way to see a real seasonal shape
+            _ha["yr"] = _ha["month"].str[:4]
+            _ha["mo"] = _ha["month"].str[5:7]
+            if _ha["yr"].nunique() >= 2:
+                _piv = _ha.pivot_table(index="mo", columns="yr", values=_hc, aggfunc="sum")
+                _fy = go.Figure()
+                for _y in _piv.columns:
+                    _fy.add_trace(go.Scatter(x=_piv.index, y=_piv[_y], mode="lines+markers", name=str(_y)))
+                _fy.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10), plot_bgcolor="white",
+                                   xaxis_title="Month of year", yaxis_title=("$" if _hc == "revenue" else "kg"),
+                                   yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                                   legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+                st.plotly_chart(_fy, use_container_width=True)
+                st.caption("Each line is one year. Where the lines rise and fall together, that's a real "
+                           "seasonal pattern the forecast can learn. Where they don't, the variation is "
+                           "year-specific and can't be predicted from the calendar.")
+
+                _det = detect_seasonal_period(_ha[_hc].tolist())
+                if _det:
+                    st.success(f"A repeating {_det}-month cycle is detectable in this history — "
+                               "the forecast can use it.")
+                else:
+                    st.info("No consistent month-of-year pattern is detectable yet. The months move, "
+                            "but not the same way each year — so the forecast follows the trend rather "
+                            "than inventing a seasonal shape.")
 
     st.divider()
     st.markdown("## Reconciliation — plan vs. reality")

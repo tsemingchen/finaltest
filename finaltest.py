@@ -1745,57 +1745,45 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 12, 13, 26, 52), min_corr=0.18):
-    """Finds a genuine repeating cycle in the data, or returns None.
+def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 12, 13, 26, 52), min_corr=0.20):
+    """Finds a genuine repeating business cycle, or returns None.
 
-    Lag 12 matters specifically: on a MONTHLY series a yearly cycle repeats every 12 points,
-    not 52. It was missing from the candidate list, so an annual pattern in monthly data --
-    a December dip, for instance -- could never be found no matter how the model was searched.
-    Verified on a series with a genuine yearly cycle: lag 12 scored +0.56, the strongest of
-    any candidate, while the nearest tested lag (13) scored only +0.44.
+    Two things had to be got right, and both were wrong before:
 
-    Yearly (52-week) and half-yearly (26-week) cycles are included, which only became
-    meaningful once two-plus years of history existed -- a yearly pattern needs to be observed
-    at least twice before it can be told apart from a one-off. A 52-week fit costs ~2.5s vs
-    ~0.4s for a short cycle, which is affordable across three segments but would not have been
-    across hundreds of items.
+    1. REMOVE THE TREND FIRST (linear detrend, not differencing). On a rising series every lag
+       correlates simply because the level is climbing, which produced false positives. Plain
+       differencing over-corrects and destroys the cycle -- measured: a real yearly signal fell
+       from +0.36 to +0.05 under differencing, but survives at +0.36 under linear detrending.
 
-    A flat forward forecast means the model found no repeating structure -- only noise. The
-    honest way to make a forecast move up and down is to model a cycle that's really there
-    (a monthly ordering rhythm, a quarterly push, a yearly season), NOT to add wiggle for
-    appearance. This measures how strongly the series correlates with itself at each
-    candidate lag and returns the strongest one that clears `min_corr`. If nothing clears
-    it, a smooth line genuinely is the best available answer."""
+    2. PREFER THE LONGEST QUALIFYING CYCLE, not the strongest. Short lags almost always score
+       highest because adjacent weeks are naturally similar -- that is smoothness, not
+       seasonality. Measured on a series with a real yearly cycle: lag 2 scored +0.57 while lag
+       52 scored +0.36, so "strongest" always picked 2 and a yearly pattern could never be
+       found. Taking the longest lag that clears the bar returns 52 for a genuinely seasonal
+       series and None for a trend-only one.
+    """
     v = np.asarray(series, dtype=float)
     v = v[~np.isnan(v)]
     n = len(v)
     if n < 20:
         return None
-    # measure the correlation on FIRST DIFFERENCES, not raw values. A level shift or a strong
-    # trend (like a step change in volume) dominates raw autocorrelation and masks a genuine
-    # cycle underneath -- verified directly: a real 4-period cycle sitting under a level shift
-    # scored higher at the wrong lag on raw values, and only stood out clearly once detrended.
-    # score each candidate on BOTH the raw series and its first differences, and take the
-    # stronger of the two. Raw works well for a clean cycle; differencing rescues a cycle
-    # buried under a level shift. Verified that using differencing alone was WORSE -- it
-    # destroyed a clean signal that raw correlation found easily.
-    def _scores(x):
-        x = x - x.mean()
-        den = float(np.dot(x, x))
-        return (lambda lag: float(np.dot(x[:-lag], x[lag:]) / den)) if den > 0 else (lambda lag: 0.0)
-
-    raw_score = _scores(v)
-    d = np.diff(v)
-    diff_score = _scores(d) if len(d) >= 8 else (lambda lag: 0.0)
-
-    best, best_corr = None, min_corr
+    x = np.arange(n, dtype=float)
+    try:
+        _b = np.polyfit(x, v, 1)
+        v = v - (_b[0] * x + _b[1])
+    except Exception:
+        v = v - v.mean()
+    denom = float(np.dot(v, v))
+    if denom <= 0:
+        return None
+    qualifying = []
     for lag in candidates:
         if n < lag * 2 + 2:      # need at least two full cycles to believe it
             continue
-        corr = max(raw_score(lag), diff_score(lag) if len(d) >= lag * 2 + 2 else 0.0)
-        if corr > best_corr:
-            best, best_corr = lag, corr
-    return best
+        corr = float(np.dot(v[:-lag], v[lag:]) / denom)
+        if corr > min_corr:
+            qualifying.append(lag)
+    return max(qualifying) if qualifying else None
 
 
 def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_trend=False,

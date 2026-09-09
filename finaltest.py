@@ -3233,552 +3233,130 @@ with tab_dash:
                            "uploaded sales history — not a manually entered number.")
 
         st.divider()
-        view = st.radio("View", ["Weekly report", "Monthly report"], horizontal=True)
+        st.subheader("Export for your teams")
+        st.caption(
+            "Each team gets only what they act on, as a self-contained Excel file — no login "
+            "or app access needed to open it."
+        )
 
-        # Accuracy analysis is opt-in -- it's by far the most expensive computation here
-        # (one model fit per segment per week), and Streamlit reruns everything on every
-        # click, so running it automatically meant paying that cost constantly.
-        if backtest_df.empty:
-            st.info("Accuracy analysis hasn't been run yet for this session.")
-            bt_weeks = st.slider("Weeks of history to check", 4, 26, 8, key="bt_weeks")
-            if st.button("Run accuracy analysis"):
-                with st.spinner(f"Checking the last {bt_weeks} weeks..."):
-                    st.session_state["backtest_df"] = backtest_accuracy(
-                        weekly_actual, max_backtest_weeks=bt_weeks)
-                st.rerun()
-        else:
-            if st.button("Refresh accuracy analysis"):
-                st.session_state.pop("backtest_df", None)
-                st.rerun()
+        _exp_freq = st.radio("Horizon for the operational exports",
+                             ["Monthly (3 months)", "Weekly (8 weeks)"],
+                             horizontal=True, key="export_freq")
+        _exp_month = _exp_freq.startswith("Monthly")
+        _team = st.selectbox(
+            "Which team is this for?",
+            ["Sales — KPIs and forecast",
+             "Green coffee — kg by coffee group",
+             "Packaging — bag order by size and item"],
+            key="export_team")
 
-        if view == "Weekly report":
-            st.markdown("**Accuracy overview — every segment at a glance**")
-            st.caption(f"Broken down by: {' × '.join(group_cols) if group_cols else '(none — fully filtered to one specific segment)'}")
+        if st.button("Build the export", key="build_team_export", type="primary"):
+            _buf = io.BytesIO()
+            _fname = "export.xlsx"
+            with pd.ExcelWriter(_buf, engine="openpyxl") as _xw:
+                if _team.startswith("Sales"):
+                    _fname = f"sales_forecast_{cycle}.xlsx"
+                    pd.DataFrame([
+                        {"Metric": "Forecast period", "Value": forecast_period_label},
+                        {"Metric": "Forecast (kg)", "Value": round(next_week_kg_all, 1)},
+                        {"Metric": "Forecast value (CAD)", "Value": round(next_week_cad_all, 2)},
+                        {"Metric": "Latest actual week", "Value": str(latest_actual_week or "")},
+                        {"Metric": "Latest actual (kg)", "Value": round(latest_actual_kg or 0, 1)},
+                    ]).to_excel(_xw, sheet_name="KPIs", index=False)
+                    _seg_fc_exp = compute_segment_forecast(sales_df, freq="W")
+                    pd.DataFrame([{"Segment": k, "Next week forecast (kg)": round(v, 1)}
+                                  for k, v in _seg_fc_exp.items()]).to_excel(
+                        _xw, sheet_name="Forecast by segment", index=False)
+                    _tr = sales_df.copy()
+                    _tr["record_date"] = pd.to_datetime(_tr["record_date"], errors="coerce")
+                    _tr["Week"] = (_tr["record_date"] - pd.to_timedelta(
+                        _tr["record_date"].dt.weekday, unit="D")).dt.date.astype(str)
+                    _tr = _tr.groupby("Week", as_index=False).agg(
+                        **{"Actual kg": ("kg", "sum"), "Actual revenue": ("revenue", "sum")})
+                    _bt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
+                    if not _bt.empty:
+                        _aj = event_adjustment_by_period(all_events_all, _bt["period"].tolist(), freq="W")
+                        _bt = _bt.copy()
+                        _bt["forecast_kg"] = _bt["forecast_kg"] + _bt["period"].map(_aj).fillna(0)
+                        _tr = _tr.merge(_bt.rename(columns={"period": "Week", "forecast_kg": "Forecast kg"}),
+                                        on="Week", how="left")
+                    _tr.to_excel(_xw, sheet_name="Weekly trend", index=False)
 
-            if not group_cols:
-                if filter_values:
-                    st.info("All three are filtered to specific values, so there's nothing left to break down — "
-                            "check the KPI cards and Overall Trend above for this exact segment.")
-                else:
-                    st.info("No dimension is set to 'All', so there's nothing to break down into rows — "
-                            "set at least one to 'All' to see a breakdown, or check Overview above for the total.")
-                bt = pd.DataFrame()
-                cadence_df = pd.DataFrame()
-            elif "customer" in group_cols:
-                cadence_df = pd.DataFrame()
-                if not has_data or "customer" not in sales_df.columns or (sales_df["customer"] == "(not tracked)").all():
-                    st.warning("This data source doesn't include customer identity, so any grouping including "
-                               "Customer isn't available.")
-                    bt = pd.DataFrame()
-                else:
-                    base_df = sales_df[sales_df["customer"] != "(not tracked)"]
-                    weekly_g = compute_weekly_actuals_by(base_df, group_cols)
-                    bt = backtest_accuracy(weekly_g, group_cols=group_cols)
-                    if not bt.empty:
-                        enough_history = bt.groupby(group_cols, as_index=False)["week_start"].count()
-                        keep_df = enough_history[enough_history["week_start"] >= 3][group_cols]
-                        bt = bt.merge(keep_df, on=group_cols, how="inner")
-                        if bt.empty:
-                            st.info("No combination has enough order history yet (need 3+ forecastable weeks) "
-                                     "at this granularity — try removing Customer or a dimension.")
-                        elif group_cols == ["customer"]:
-                            cadence_rows = []
-                            latest_data_date = pd.to_datetime(sales_df["record_date"], errors="coerce").max()
-                            for cust, grp in weekly_g[weekly_g["customer"].isin(bt["customer"].unique())].groupby("customer"):
-                                dates = pd.to_datetime(grp["week_start"]).sort_values()
-                                gaps = dates.diff().dt.days.dropna() / 7
-                                cadence_rows.append({
-                                    "customer": cust,
-                                    "avg_reorder_weeks": round(gaps.mean(), 1) if len(gaps) else None,
-                                    "weeks_since_last_order": round((latest_data_date - dates.max()).days / 7, 1),
-                                })
-                            cadence_df = pd.DataFrame(cadence_rows)
-            else:
-                cadence_df = pd.DataFrame()
-                bt = backtest_df.copy()
-                if group_cols != ["channel", "product"] and not bt.empty:
-                    bt = bt.groupby(group_cols + ["week_start"], as_index=False).agg(
-                        forecast_kg=("forecast_kg", "sum"), actual_kg=("actual_kg", "sum"),
-                        n_weeks_history=("n_weeks_history", "min"))
-                    bt["variance_pct"] = (bt["actual_kg"] - bt["forecast_kg"]) / bt["forecast_kg"].replace(0, np.nan)
-
-            if bt.empty:
-                st.info("Nothing to show for this grouping yet.")
-            else:
-                latest_week = bt["week_start"].max()
-                overview_rows = []
-                for key, grp in bt.groupby(group_cols):
-                    grp = grp.sort_values("week_start")
-                    label = key if isinstance(key, str) else " — ".join(key)
-                    last_row = grp.iloc[-1]
-                    recent_bias = grp["variance_pct"].tail(4).mean()
-                    weeks_of_history = grp["n_weeks_history"].iloc[-1] if "n_weeks_history" in grp.columns else None
-                    if pd.isna(recent_bias):
-                        status = "Not enough data"
-                    elif abs(recent_bias) > 0.15:
-                        status = "ALERT"
-                    elif abs(recent_bias) > 0.08:
-                        status = "WATCH"
+                elif _team.startswith("Green coffee"):
+                    _fname = f"green_coffee_plan_{cycle}.xlsx"
+                    _gmx = load_item_groups()
+                    _gb = compute_all_channel_bag_breakdown(
+                        sales_df, n_periods=3 if _exp_month else 8, freq="M" if _exp_month else "W")
+                    _gb = _gb[_gb["segment"].astype(str).str.startswith("Staple")] if not _gb.empty else _gb
+                    if _gb.empty:
+                        pd.DataFrame([{"Note": "Not enough Staple history yet."}]).to_excel(
+                            _xw, sheet_name="Green coffee", index=False)
                     else:
-                        status = "OK"
-                    confidence = "Low (little history)" if (weeks_of_history is not None and weeks_of_history < 4) else "Normal"
-                    row = {
-                        "Segment": label, "Latest forecast (kg)": round(last_row["forecast_kg"]),
-                        "Latest actual (kg)": round(last_row["actual_kg"]),
-                        "Recent 4wk bias": f"{recent_bias*100:+.0f}%" if pd.notna(recent_bias) else "n/a",
-                        "Confidence": confidence, "Status": status,
-                    }
-                    if group_cols == ["customer"] and not cadence_df.empty:
-                        cad = cadence_df[cadence_df["customer"].astype(str) == str(label)]
-                        if not cad.empty:
-                            row["Avg reorder (weeks)"] = cad.iloc[0]["avg_reorder_weeks"]
-                            row["Weeks since last order"] = cad.iloc[0]["weeks_since_last_order"]
-                    overview_rows.append(row)
-                overview_df = pd.DataFrame(overview_rows).sort_values(
-                    "Status", key=lambda s: s.map({"ALERT": 0, "WATCH": 1, "OK": 2, "Not enough data": 3}))
+                        _gb = _gb.copy()
+                        _gb["Coffee group"] = _gb["product"].map(lambda p: map_to_group(p, _gmx))
+                        _pv = _gb.pivot_table(index="Coffee group", columns="period",
+                                               values="forecast_kg", aggfunc="sum").round(0)
+                        _pv["Total kg"] = _pv.sum(axis=1).round(0)
+                        _pv.sort_values("Total kg", ascending=False).to_excel(_xw, sheet_name="Kg by coffee group")
+                        _gb.groupby(["Coffee group", "product", "period"], as_index=False)["forecast_kg"] \
+                            .sum().round(1).rename(columns={"product": "Item ID", "period": "Period",
+                                                             "forecast_kg": "Forecast kg"}) \
+                            .to_excel(_xw, sheet_name="Detail by item", index=False)
 
-                def _flag(row):
-                    color = {"ALERT": "background-color: #fbeae6", "WATCH": "background-color: #fdf3e0",
-                             "OK": "", "Not enough data": ""}.get(row["Status"], "")
-                    return [color] * len(row)
-                st.dataframe(overview_df.style.apply(_flag, axis=1), use_container_width=True, hide_index=True)
-                st.caption(f"As of week of {latest_week}. ALERT = recent actuals off by 15%+ from forecast, "
-                           "WATCH = 8-15%. Confidence 'Low' means under 4 weeks of history fed the forecast — "
-                           "treat those numbers as rough, not reliable.")
+                else:
+                    _fname = f"packaging_bag_order_{cycle}.xlsx"
+                    _sadj = {}
+                    if type_level_forecasts:
+                        for _lb, _bs in type_level_forecasts.items():
+                            _dd = type_level_forecasts_with_pipeline.get(_lb, _bs) - _bs
+                            if abs(_dd) > 0.01:
+                                _sadj[_lb] = _dd * (4.345 if _exp_month else 1.0)
+                    _bag = compute_all_channel_bag_breakdown(
+                        sales_df, n_periods=3 if _exp_month else 8,
+                        freq="M" if _exp_month else "W", segment_adjust=_sadj)
+                    if _bag.empty:
+                        pd.DataFrame([{"Note": "Not enough history yet."}]).to_excel(
+                            _xw, sheet_name="Bag order", index=False)
+                    else:
+                        _gmx = load_item_groups()
+                        _bx = _bag.copy()
+                        _bg = pd.to_numeric(_bx["forecast_bags"], errors="coerce")
+                        _pmx = _bx["product"].astype(str).str.upper().str.extract(r"^(.*?)X(\d+)$")
+                        _pk = _pmx[0].notna() & _pmx[1].notna()
+                        if _pk.any():
+                            _bg.loc[_pk] = _bg.loc[_pk] * pd.to_numeric(_pmx[1][_pk])
+                            _bx.loc[_pk, "product"] = _pmx[0][_pk]
+                        _smx = _bx["size_label"].astype(str).str.upper().str.extract(r"^SET(\d*)-(.+)$")
+                        _sk = _smx[1].notna()
+                        if _sk.any():
+                            _bg.loc[_sk] = _bg.loc[_sk] * pd.to_numeric(_smx[0], errors="coerce").fillna(3)[_sk]
+                            _bx.loc[_sk, "size_label"] = _bx.loc[_sk, "size_label"].astype(str).str.replace(
+                                r"^SET\d*-", "", regex=True)
+                        _bx["forecast_bags"] = _bg
+                        _bx = _bx[_bx["size_label"].astype(str).str.lower() != "nan"]
+                        _bx["Labelled by"] = _bx.apply(
+                            lambda r: "Bag supplier (pre-printed)"
+                            if is_supplier_labelled(r["product"], r["size_label"], _gmx)
+                            else "Roastery (labelled in-house)", axis=1)
+                        _sup = _bx[_bx["Labelled by"].str.startswith("Bag supplier")]
+                        if not _sup.empty:
+                            _sup.pivot_table(index=["product", "size_label"], columns="period",
+                                              values="forecast_bags", aggfunc="sum").round(0).to_excel(
+                                _xw, sheet_name="Supplier bags")
+                        _roa = _bx[_bx["Labelled by"].str.startswith("Roastery")]
+                        if not _roa.empty:
+                            _roa.pivot_table(index="size_label", columns="period",
+                                              values="forecast_bags", aggfunc="sum").round(0).to_excel(
+                                _xw, sheet_name="Roastery bags")
+                        _bx.groupby(["Labelled by", "product", "size_label", "period"], as_index=False).agg(
+                            **{"Forecast kg": ("forecast_kg", "sum"), "Qty (bags)": ("forecast_bags", "sum")}
+                        ).round(1).rename(columns={"product": "Item ID", "size_label": "Bag size",
+                                                    "period": "Period"}).to_excel(
+                            _xw, sheet_name="Full detail", index=False)
+                        compute_kg_per_bag(sales_df).to_excel(_xw, sheet_name="Kg per bag", index=False)
 
-        else:  # Monthly report
-            bt = backtest_df.copy()
-            if bt.empty:
-                st.info("Run the accuracy analysis above to see the monthly report.")
-            else:
-                bt["month"] = pd.to_datetime(bt["week_start"]).dt.to_period("M").astype(str)
-                bt["abs_variance_pct"] = bt["variance_pct"].abs()
-                monthly = bt.groupby(["channel", "product", "month"], as_index=False).agg(
-                    MAPE=("abs_variance_pct", "mean"), Bias=("variance_pct", "mean"), weeks=("week_start", "count"))
-                monthly["MAPE_%"] = (monthly["MAPE"] * 100).round(1)
-                monthly["Bias_%"] = (monthly["Bias"] * 100).round(1)
-                st.dataframe(monthly[["month", "channel", "product", "MAPE_%", "Bias_%", "weeks"]]
-                             .sort_values("month", ascending=False), use_container_width=True)
-                st.caption("Positive bias = actuals running ahead of the auto-forecast (under-forecasting). "
-                           "Negative = over-forecasting. MAPE = average error size regardless of direction.")
-
-    # --- downloadable snapshot report, for meetings ---
-    if has_data and not backtest_df.empty:
-        st.divider()
-        st.subheader("Download a report")
-        st.caption("A self-contained snapshot of the current dashboard — everyone in a meeting can open it, "
-                   "no login or app access needed.")
-
-        # shared data prep, used by all three report formats
-        gen_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-        cap_row2 = pd.read_sql("SELECT * FROM ops_capacity WHERE cycle_label = ? ORDER BY id DESC LIMIT 1",
-                                conn, params=(cycle,))
-        cap_status_text, cap_shortfall = None, False
-        if not cap_row2.empty and not forecast_by_cp.empty:
-            cap2 = cap_row2.iloc[0]["monthly_capacity_kg"]
-            planned2 = forecast_by_cp["forecast_kg"].sum() * 4.345
-            cap_shortfall = cap2 < planned2
-            cap_status_text = (f"Capacity check: {planned2:,.0f} kg/month planned vs {cap2:,.0f} kg/month "
-                                f"capacity — {'SHORTFALL' if cap_shortfall else 'OK'}")
-
-        report_dollar_df = pd.DataFrame()
-        if not dollar_by_cp.empty:
-            report_dollar_df = dollar_by_cp.rename(columns={"channel": "Channel", "product": "Item",
-                                                              "forecast_kg": "Forecast (kg)", "forecast_cad": "Forecast (CAD)"})
-
-        ov = backtest_df.copy()
-        latest_wk = ov["week_start"].max()
-        summary_rows = []
-        for key, grp in ov.groupby(["channel", "product"]):
-            grp = grp.sort_values("week_start")
-            bias = grp["variance_pct"].tail(4).mean()
-            status = "ALERT" if pd.notna(bias) and abs(bias) > 0.15 else \
-                ("WATCH" if pd.notna(bias) and abs(bias) > 0.08 else ("OK" if pd.notna(bias) else "n/a"))
-            summary_rows.append({"Channel": key[0], "Item": key[1],
-                                  "Latest forecast (kg)": round(grp.iloc[-1]["forecast_kg"]),
-                                  "Latest actual (kg)": round(grp.iloc[-1]["actual_kg"]),
-                                  "Recent 4wk bias": f"{bias*100:+.0f}%" if pd.notna(bias) else "n/a",
-                                  "Status": status})
-        report_overview_df = pd.DataFrame(summary_rows).sort_values(
-            "Status", key=lambda s: s.map({"ALERT": 0, "WATCH": 1, "OK": 2, "n/a": 3}))
-
-        acc = backtest_df.copy()
-        acc["abs_variance_pct"] = acc["variance_pct"].abs()
-        acc_monthly = acc.copy()
-        acc_monthly["month"] = pd.to_datetime(acc_monthly["week_start"]).dt.to_period("M").astype(str)
-        report_accuracy_df = acc_monthly.groupby(["channel", "product"], as_index=False).agg(
-            MAPE=("abs_variance_pct", "mean"), Bias=("variance_pct", "mean"), weeks_tracked=("week_start", "count"))
-        report_accuracy_df["MAPE_%"] = (report_accuracy_df["MAPE"] * 100).round(1)
-        report_accuracy_df["Bias_%"] = (report_accuracy_df["Bias"] * 100).round(1)
-        report_accuracy_df = report_accuracy_df.rename(columns={"channel": "Channel", "product": "Item"})[
-            ["Channel", "Item", "MAPE_%", "Bias_%", "weeks_tracked"]].sort_values("MAPE_%", ascending=False)
-
-        # trend chart data (actual, all history) for embedding
-        d_report_trend = sales_df.copy()
-        d_report_trend["record_date"] = pd.to_datetime(d_report_trend["record_date"], errors="coerce")
-        d_report_trend = d_report_trend.dropna(subset=["record_date"])
-        d_report_trend["period"] = (d_report_trend["record_date"] -
-                                     pd.to_timedelta(d_report_trend["record_date"].dt.weekday, unit="D")).dt.date.astype(str)
-        report_trend_df = d_report_trend.groupby("period", as_index=False)["kg"].sum().sort_values("period")
-
-        report_bar_df = dollar_by_cp.copy() if not dollar_by_cp.empty else pd.DataFrame()
-
-        def build_report_html():
-            cap_html = ""
-            if cap_status_text:
-                color2 = "#b3432f" if cap_shortfall else "#4a7a5c"
-                cap_html = f'<p style="color:{color2};font-weight:600">{cap_status_text}</p>'
-            # report is intentionally KPI + charts only -- the detail tables were dropped so
-            # it reads as a one-glance summary for a meeting rather than a data dump
-
-            # match the Overview chart: a blue actual line (no fill), named series, last 6
-            # months only. The filled brown area over 2+ years was unreadable and the legend
-            # said "trace 0".
-            _rt = report_trend_df.tail(26)
-            trend_fig = go.Figure(go.Scatter(x=_rt["period"], y=_rt["kg"], mode="lines",
-                                              name="Actual", line=dict(color="#1f77b4", width=2)))
-            trend_fig.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10),
-                                     plot_bgcolor="white",
-                                     xaxis_title="Week", yaxis_title="Total kg",
-                                     yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                                     legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                                                 xanchor="left", x=0))
-            trend_chart_html = trend_fig.to_html(include_plotlyjs="cdn", full_html=False)
-
-            # overlay the backtested forecast line, exactly as the Overview chart shows it,
-            # so the report is the same picture rather than a different-looking summary
-            try:
-                _rep_bt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
-                if not _rep_bt.empty:
-                    _rep_adj = event_adjustment_by_period(all_events_all, _rep_bt["period"].tolist(), freq="W")
-                    _rep_bt = _rep_bt.copy()
-                    _rep_bt["forecast_kg"] = _rep_bt["forecast_kg"] + _rep_bt["period"].map(_rep_adj).fillna(0)
-                    trend_fig.add_trace(go.Scatter(
-                        x=_rep_bt[_rep_bt["period"].isin(_rt["period"])]["period"],
-                        y=_rep_bt[_rep_bt["period"].isin(_rt["period"])]["forecast_kg"], mode="lines",
-                        name="Auto forecast (backtested)", line=dict(color="#8b5a3c", dash="dash")))
-                    trend_fig.update_layout(showlegend=True, legend=dict(
-                        orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
-                    trend_chart_html = trend_fig.to_html(include_plotlyjs="cdn", full_html=False)
-            except Exception:
-                pass  # report should still generate if the backtest can't be computed
-
-            # the three segment charts, same as the Overview page
-            seg_charts_html = ""
-            try:
-                for _lab, _sdf in split_into_segments(sales_df).items():
-                    _sagg = aggregate_periods(_sdf, ["product_type"], "W")
-                    _sagg = _sagg.groupby("period", as_index=False)["actual_kg"].sum().sort_values("period").tail(26)
-                    if len(_sagg) < 2:
-                        continue
-                    _sfig = go.Figure(go.Scatter(x=_sagg["period"], y=_sagg["actual_kg"], mode="lines",
-                                                  name="Actual", line=dict(color="#1f77b4", width=2)))
-                    _sproj = project_forward_with_range(_sagg["actual_kg"].tolist(), None,
-                                                         n_periods=8, keep_trend=True)
-                    if not _sproj.empty:
-                        _last = pd.Timestamp(_sagg["period"].iloc[-1])
-                        _fx = [(_last + pd.Timedelta(weeks=i + 1)).date().isoformat()
-                               for i in range(len(_sproj))]
-                        _sfig.add_trace(go.Scatter(x=_fx, y=_sproj["forecast_kg"], mode="lines",
-                                                    name="Forecast (ahead)", line=dict(color="#555", width=2)))
-                    _sfig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10),
-                                         plot_bgcolor="white", yaxis_title="kg",
-                                         yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                                         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                                                     xanchor="left", x=0))
-                    seg_charts_html += f"<h3 style='font-size:14px;margin-top:1.2rem'>{_lab}</h3>"
-                    seg_charts_html += _sfig.to_html(include_plotlyjs=False, full_html=False)
-            except Exception:
-                pass
-
-            # the breakdown exactly as it's filtered on screen, not a fixed top-15 bar chart
-            bar_chart_html = ""
-            _bd = st.session_state.get("_report_breakdown")
-            if _bd is not None and not _bd.empty:
-                bar_sorted = _bd.sort_values("forecast_kg", ascending=True).tail(15)
-                bar_fig = go.Figure(go.Bar(x=bar_sorted["forecast_kg"], y=bar_sorted["Segment"].astype(str),
-                                            orientation="h", marker_color="#2F6F6B"))
-                bar_fig.update_layout(height=max(280, 26 * len(bar_sorted)),
-                                       margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Forecast kg")
-                bar_chart_html = bar_fig.to_html(include_plotlyjs=False, full_html=False)
-                bar_chart_html += _bd[["Segment", "forecast_kg"]].rename(
-                    columns={"forecast_kg": "Forecast kg"}).to_html(index=False, border=0)
-
-            return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Demand Planning Report — {cycle}</title>
-<style>
-body{{font-family:-apple-system,Arial,sans-serif;max-width:900px;margin:2rem auto;color:#2b2622;padding:0 1.5rem}}
-h1{{font-size:22px;margin-bottom:4px}} h2{{font-size:16px;margin-top:2rem}}
-table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:0.5rem}}
-th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #e3ddd1}}
-th{{background:#f3efe8}} .meta{{color:#6b6258;font-size:13px}}
-</style></head><body>
-<h1>Demand Planning Report</h1>
-<p class="meta">Cycle {cycle} — generated {gen_time} — as of week of {latest_wk}</p>
-{cap_html}
-<h2>Overall trend — actual sales</h2>
-{trend_chart_html}
-<h2>Forecast by segment</h2>
-{seg_charts_html if seg_charts_html else "<p>Not enough history per segment yet.</p>"}
-<h2>Forecast breakdown — by {st.session_state.get("_report_breakdown_label", "segment")}</h2>
-{bar_chart_html if bar_chart_html else "<p>Open the Dashboard breakdown first, then generate the report.</p>"}
-<p class="meta">Generated automatically from 49th Parallel's demand planning app.</p>
-</body></html>"""
-
-        def build_report_pdf():
-            def safe(t):
-                t = str(t)
-                for a, b in [("\u2014", "-"), ("\u2013", "-"), ("\u2018", "'"), ("\u2019", "'"),
-                             ("\u201c", '"'), ("\u201d", '"'), ("\u2026", "...")]:
-                    t = t.replace(a, b)
-                return t.encode("latin-1", "replace").decode("latin-1")
-
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, "Demand Planning Report", new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("Helvetica", "", 9)
-            pdf.cell(0, 6, safe(f"Cycle {cycle} -- generated {gen_time} -- as of week of {latest_wk}"),
-                     new_x="LMARGIN", new_y="NEXT")
-            if cap_status_text:
-                pdf.ln(2)
-                pdf.set_text_color(179, 67, 47) if cap_shortfall else pdf.set_text_color(74, 122, 92)
-                pdf.set_font("Helvetica", "B", 10)
-                pdf.multi_cell(0, 6, safe(cap_status_text))
-                pdf.set_text_color(0, 0, 0)
-
-            def draw_table(title, df, col_widths):
-                pdf.ln(4)
-                pdf.set_font("Helvetica", "B", 12)
-                pdf.cell(0, 8, safe(title), new_x="LMARGIN", new_y="NEXT")
-                if df.empty:
-                    pdf.set_font("Helvetica", "", 9)
-                    pdf.cell(0, 6, "No data available.", new_x="LMARGIN", new_y="NEXT")
-                    return
-                pdf.set_font("Helvetica", "B", 8)
-                for w, h in zip(col_widths, df.columns):
-                    pdf.cell(w, 7, safe(str(h))[:28], border=1)
-                pdf.ln()
-                pdf.set_font("Helvetica", "", 8)
-                for _, r in df.iterrows():
-                    for w, v in zip(col_widths, r):
-                        pdf.cell(w, 6, safe(str(v))[:30], border=1)
-                    pdf.ln()
-
-            def draw_line_chart(title, series_list, width=180, height=70):
-                """Hand-drawn multi-series line chart -- fpdf has no charting and rendering a
-                plotly image would need a headless browser, which isn't available here. Same
-                content as the HTML report's chart, drawn with primitives."""
-                pdf.ln(4)
-                pdf.set_font("Helvetica", "B", 12)
-                pdf.cell(0, 8, safe(title), new_x="LMARGIN", new_y="NEXT")
-                _all = [v for _, ys, _ in series_list for v in ys if v is not None]
-                if not _all:
-                    pdf.set_font("Helvetica", "", 9)
-                    pdf.cell(0, 6, "No data available.", new_x="LMARGIN", new_y="NEXT")
-                    return
-                lo, hi = min(_all), max(_all)
-                span = (hi - lo) or 1
-                x0, y0 = pdf.get_x(), pdf.get_y()
-                pdf.set_draw_color(210, 210, 210)
-                pdf.rect(x0, y0, width, height)
-                n_max = max(len(ys) for _, ys, _ in series_list)
-                for name, ys, rgb in series_list:
-                    pdf.set_draw_color(*rgb)
-                    pts = [(x0 + (i / max(n_max - 1, 1)) * width,
-                            y0 + height - ((v - lo) / span) * height)
-                           for i, v in enumerate(ys) if v is not None]
-                    for a, b in zip(pts, pts[1:]):
-                        pdf.line(a[0], a[1], b[0], b[1])
-                pdf.set_y(y0 + height + 2)
-                pdf.set_font("Helvetica", "", 7)
-                pdf.set_text_color(90, 90, 90)
-                pdf.cell(0, 4, safe("  |  ".join(f"{n}" for n, _, _ in series_list)
-                                    + f"   (range {lo:,.0f} - {hi:,.0f} kg)"),
-                         new_x="LMARGIN", new_y="NEXT")
-                pdf.set_text_color(0, 0, 0)
-                pdf.set_draw_color(0, 0, 0)
-
-            def draw_bar_chart(title, labels, values, chart_width=180, bar_height=6, gap=2):
-                """Hand-drawn horizontal bar chart -- no image rendering, no Chrome needed."""
-                pdf.ln(4)
-                pdf.set_font("Helvetica", "B", 12)
-                pdf.cell(0, 8, safe(title), new_x="LMARGIN", new_y="NEXT")
-                if not len(values):
-                    pdf.set_font("Helvetica", "", 9)
-                    pdf.cell(0, 6, "No data available.", new_x="LMARGIN", new_y="NEXT")
-                    return
-                max_val = max(values) if max(values) > 0 else 1
-                label_width = 65
-                bar_area = chart_width - label_width - 20
-                x0 = pdf.get_x()
-                for label, val in zip(labels, values):
-                    y0 = pdf.get_y()
-                    pdf.set_font("Helvetica", "", 7)
-                    pdf.cell(label_width, bar_height, safe(str(label))[:38], new_x="LMARGIN", new_y="TOP")
-                    bar_len = max(1, (val / max_val) * bar_area)
-                    pdf.set_fill_color(139, 90, 60)
-                    pdf.rect(x0 + label_width, y0, bar_len, bar_height, style="F")
-                    pdf.set_xy(x0 + label_width + bar_len + 2, y0)
-                    pdf.set_font("Helvetica", "", 7)
-                    pdf.cell(20, bar_height, f"{val:,.0f}", new_x="LMARGIN", new_y="NEXT")
-                    pdf.set_x(x0)
-                    pdf.set_y(y0 + bar_height + gap)
-
-            # same two charts as the HTML report: actual-vs-backtested trend, then the
-            # on-screen breakdown. Tables intentionally omitted -- this report is charts only.
-            if not report_trend_df.empty:
-                _tr = report_trend_df.tail(26)
-                _series = [("Actual", _tr["kg"].tolist(), (31, 119, 180))]
-                try:
-                    _pbt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
-                    if not _pbt.empty:
-                        _padj = event_adjustment_by_period(all_events_all, _pbt["period"].tolist(), freq="W")
-                        _pbt = _pbt.copy()
-                        _pbt["forecast_kg"] = _pbt["forecast_kg"] + _pbt["period"].map(_padj).fillna(0)
-                        _m = _tr[["period"]].merge(_pbt, on="period", how="left")
-                        _series.append(("Auto forecast (backtested)",
-                                        _m["forecast_kg"].tolist(), (139, 90, 60)))
-                except Exception:
-                    pass
-                draw_line_chart("Overall trend - actual vs forecast", _series)
-
-            _pbd = st.session_state.get("_report_breakdown")
-            if _pbd is not None and not _pbd.empty:
-                _bt2 = _pbd.sort_values("forecast_kg", ascending=False).head(12)
-                draw_bar_chart(
-                    f"Forecast breakdown - by {st.session_state.get('_report_breakdown_label', 'segment')}",
-                    _bt2["Segment"].astype(str).tolist(), _bt2["forecast_kg"].tolist())
-
-            pdf.add_page()
-            draw_table("Forecast accuracy - MAPE and bias", report_accuracy_df, [45, 55, 25, 25, 30])
-
-            pdf.ln(6)
-            pdf.set_font("Helvetica", "I", 8)
-            pdf.set_text_color(107, 98, 88)
-            pdf.multi_cell(0, 5, "ALERT = actuals off by 15%+ from forecast over the last 4 weeks. WATCH = 8-15%. "
-                                 "MAPE = average error size regardless of direction. Bias: positive = "
-                                 "under-forecasting, negative = over-forecasting. "
-                                 "Generated automatically from 49th Parallel's demand planning app.")
-            return bytes(pdf.output())
-
-        def build_report_excel():
-            from openpyxl.chart import BarChart, LineChart, Reference
-
-            wb = openpyxl.Workbook()
-            ws1 = wb.active
-            ws1.title = "Summary"
-            ws1["A1"] = "Demand Planning Report"
-            ws1["A1"].font = Font(bold=True, size=14)
-            ws1["A2"] = f"Cycle {cycle} — generated {gen_time} — as of week of {latest_wk}"
-            if cap_status_text:
-                ws1["A4"] = cap_status_text
-                ws1["A4"].font = Font(bold=True, color="B3432F" if cap_shortfall else "4A7A5C")
-
-            def write_df(ws, df, start_row=1):
-                for j, col in enumerate(df.columns, start=1):
-                    c = ws.cell(row=start_row, column=j, value=col)
-                    c.font = Font(bold=True, color="FFFFFF")
-                    c.fill = PatternFill("solid", fgColor="1F4E78")
-                for i, row in enumerate(df.itertuples(index=False), start=start_row + 1):
-                    for j, val in enumerate(row, start=1):
-                        ws.cell(row=i, column=j, value=val)
-                for j, col in enumerate(df.columns, start=1):
-                    ws.column_dimensions[openpyxl.utils.get_column_letter(j)].width = max(14, len(str(col)) + 2)
-
-            # trend chart -- native Excel line chart, built from real data written into the sheet
-            ws_trend = wb.create_sheet("Overall Trend")
-            trend_for_excel = report_trend_df.rename(columns={"period": "Week", "kg": "Actual kg"})
-            # add the backtested forecast as a second series, so Excel shows the same
-            # actual-vs-forecast picture as the HTML and PDF reports
-            try:
-                _xbt = walk_forward_all_segments(sales_df, n_periods=26, freq="W")
-                if not _xbt.empty:
-                    _xadj = event_adjustment_by_period(all_events_all, _xbt["period"].tolist(), freq="W")
-                    _xbt = _xbt.copy()
-                    _xbt["forecast_kg"] = _xbt["forecast_kg"] + _xbt["period"].map(_xadj).fillna(0)
-                    trend_for_excel = trend_for_excel.merge(
-                        _xbt.rename(columns={"period": "Week", "forecast_kg": "Auto forecast kg"}),
-                        on="Week", how="left")
-            except Exception:
-                pass
-            write_df(ws_trend, trend_for_excel)
-            if len(trend_for_excel) > 1:
-                chart1 = LineChart()
-                chart1.title = "Overall trend - actual vs forecast"
-                chart1.y_axis.title = "Total kg"
-                chart1.x_axis.title = "Week"
-                _ncols = len(trend_for_excel.columns)
-                data_ref = Reference(ws_trend, min_col=2, max_col=_ncols,
-                                      min_row=1, max_row=len(trend_for_excel) + 1)
-                cats_ref = Reference(ws_trend, min_col=1, min_row=2, max_row=len(trend_for_excel) + 1)
-                chart1.add_data(data_ref, titles_from_data=True)
-                chart1.set_categories(cats_ref)
-                chart1.width, chart1.height = 26, 11
-                ws_trend.add_chart(chart1, f"{openpyxl.utils.get_column_letter(_ncols + 2)}2")
-
-            # breakdown chart -- the same on-screen slice the other two formats show
-            _xbd = st.session_state.get("_report_breakdown")
-            if _xbd is not None and not _xbd.empty:
-                ws_bd = wb.create_sheet("Breakdown")
-                _bd_x = _xbd.sort_values("forecast_kg", ascending=False).rename(
-                    columns={"forecast_kg": "Forecast kg"})
-                write_df(ws_bd, _bd_x)
-                chart_bd = BarChart()
-                chart_bd.type = "bar"
-                chart_bd.title = f"Forecast breakdown - by {st.session_state.get('_report_breakdown_label', 'segment')}"
-                chart_bd.x_axis.title = "Forecast kg"
-                d_ref = Reference(ws_bd, min_col=2, min_row=1, max_row=len(_bd_x) + 1)
-                c_ref = Reference(ws_bd, min_col=1, min_row=2, max_row=len(_bd_x) + 1)
-                chart_bd.add_data(d_ref, titles_from_data=True)
-                chart_bd.set_categories(c_ref)
-                chart_bd.width, chart_bd.height = 24, max(10, 0.5 * len(_bd_x))
-                ws_bd.add_chart(chart_bd, "D2")
-
-            ws2 = wb.create_sheet("Translated Forecast")
-            if not report_dollar_df.empty:
-                bar_data = report_dollar_df.sort_values("Forecast (kg)", ascending=False).copy()
-                bar_data.insert(0, "Segment", bar_data["Channel"] + " - " + bar_data["Item"])
-                write_df(ws2, bar_data)
-                chart2 = BarChart()
-                chart2.type = "bar"
-                chart2.title = "Forecast by segment (kg)"
-                data_ref2 = Reference(ws2, min_col=4, min_row=1, max_row=len(bar_data) + 1)
-                cats_ref2 = Reference(ws2, min_col=1, min_row=2, max_row=len(bar_data) + 1)
-                chart2.add_data(data_ref2, titles_from_data=True)
-                chart2.set_categories(cats_ref2)
-                chart2.width, chart2.height = 24, 12
-                ws2.add_chart(chart2, "G2")
-
-            ws3 = wb.create_sheet("Accuracy Overview")
-            write_df(ws3, report_overview_df)
-
-            ws4 = wb.create_sheet("Accuracy - MAPE and Bias")
-            write_df(ws4, report_accuracy_df)
-
-            buf = io.BytesIO()
-            wb.save(buf)
-            return buf.getvalue()
-
-        # Reports are built ONLY when asked for. st.download_button computes its data
-        # eagerly, so having three of these unguarded meant building a full HTML report, a
-        # full PDF, AND a full Excel workbook (with charts) on every single page load --
-        # even though nobody had clicked anything. Easily one of the most expensive things
-        # in the app, and completely invisible as a cost.
-        report_kind = st.radio("Report format", ["HTML", "PDF", "Excel"], horizontal=True, key="report_kind")
-        if st.button("Generate report"):
-            if report_kind == "HTML":
-                st.download_button("Download report (HTML)", build_report_html(),
-                                    f"demand_report_{cycle}.html", mime="text/html")
-            elif report_kind == "PDF":
-                st.download_button("Download report (PDF)", build_report_pdf(),
-                                    f"demand_report_{cycle}.pdf", mime="application/pdf")
-            else:
-                st.download_button("Download report (Excel)", build_report_excel(),
-                                    f"demand_report_{cycle}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.caption("HTML opens in any browser and can be printed to PDF from there too. "
-                   "PDF and Excel are generated directly, ready to attach or print for a meeting.")
+            st.download_button(f"Download {_fname}", _buf.getvalue(), _fname,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # --- TAB 1: Upload ---
 with tab_data:

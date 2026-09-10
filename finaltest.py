@@ -690,6 +690,9 @@ def freeze_segment_forecast(segment, target_period, forecast_kg, freq="W"):
             (segment, target_period, freq, forecast_kg, generated_at) VALUES (?,?,?,?,?)""",
             (str(segment), str(target_period), freq, float(forecast_kg), datetime.now().isoformat()))
         conn.commit()
+        # make the new promise visible immediately rather than after the cache expires,
+        # otherwise the chart can still show a recomputed number on this same render
+        load_frozen_segment_forecasts.clear()
     except Exception:
         pass  # logging a forecast must never break the page
 
@@ -1678,11 +1681,21 @@ def walk_forward_all_segments(sales_df, n_periods=12, freq="W"):
     moved to three groups -- two different calculations for the same thing, which is exactly
     how the chart ended up showing roughly double what the segments summed to. Routing both
     through this one function makes them agree by construction, not by coincidence."""
+    # Apply frozen forecasts HERE, inside the shared function, so every consumer inherits it
+    # -- the chart, the accuracy KPI and the exports all call this. Patching only the segment
+    # tables left the chart and the accuracy figure still recomputing history, which is why a
+    # week promised at 6,930 kg kept showing as 5,930 kg after actuals arrived.
+    _frozen = load_frozen_segment_forecasts(freq)
     frames = []
     for label, seg_df in split_into_segments(sales_df).items():
         wf = walk_forward_segment(seg_df, n_periods=n_periods, freq=freq)
-        if not wf.empty:
-            frames.append(wf)
+        if wf.empty:
+            continue
+        if _frozen:
+            wf = wf.copy()
+            wf["forecast_kg"] = [
+                _frozen.get((label, str(p)), v) for p, v in zip(wf["period"], wf["forecast_kg"])]
+        frames.append(wf)
     if not frames:
         return pd.DataFrame(columns=["period", "forecast_kg"])
     return pd.concat(frames, ignore_index=True).groupby("period", as_index=False)["forecast_kg"].sum()
@@ -2320,7 +2333,11 @@ with tab_dash:
             if not weekly_actual.empty:
                 _tw = str((pd.Timestamp(sorted(weekly_actual["week_start"].unique())[-1])
                            + pd.Timedelta(days=7)).date())
-                for _sl, _sv in type_level_forecasts_with_pipeline.items():
+                # Freeze the BASE statistical forecast, not the event-adjusted one. Events are
+                # layered on top at every display point, so freezing the adjusted figure would
+                # add them twice. This keeps the frozen value comparable with how history is
+                # rendered everywhere else.
+                for _sl, _sv in type_level_forecasts.items():
                     freeze_segment_forecast(_sl, _tw, _sv, "W")
         else:
             next_week_kg_all = forecast_by_cp["forecast_kg"].sum() if not forecast_by_cp.empty else 0

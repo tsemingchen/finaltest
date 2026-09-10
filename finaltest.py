@@ -35,6 +35,7 @@ import streamlit as st
 from fpdf import FPDF
 import openpyxl
 from openpyxl.styles import Font, PatternFill
+from openpyxl.chart import LineChart, BarChart, Reference
 import requests
 
 st.set_page_config(page_title="49th Parallel — Demand Planning", layout="wide")
@@ -1691,14 +1692,24 @@ def walk_forward_all_segments(sales_df, n_periods=12, freq="W"):
         wf = walk_forward_segment(seg_df, n_periods=n_periods, freq=freq)
         if wf.empty:
             continue
+        wf = wf.copy()
+        # A frozen value is the complete promised number, events included. Re-applying events
+        # to it would double-count, and removing a stopped event from it would rewrite a
+        # forecast that was already made. So frozen periods are used exactly as recorded.
+        wf["_is_frozen"] = [(label, str(p)) in _frozen for p in wf["period"]]
         if _frozen:
-            wf = wf.copy()
             wf["forecast_kg"] = [
                 _frozen.get((label, str(p)), v) for p, v in zip(wf["period"], wf["forecast_kg"])]
         frames.append(wf)
     if not frames:
         return pd.DataFrame(columns=["period", "forecast_kg"])
-    return pd.concat(frames, ignore_index=True).groupby("period", as_index=False)["forecast_kg"].sum()
+    _all = pd.concat(frames, ignore_index=True)
+    out = _all.groupby("period", as_index=False)["forecast_kg"].sum()
+    # a period counts as frozen only if every segment in it was frozen
+    _fz = _all.groupby("period", as_index=False)["_is_frozen"].all()
+    out = out.merge(_fz, on="period", how="left")
+    out["_is_frozen"] = out["_is_frozen"].fillna(False)
+    return out
 
 
 @st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
@@ -2333,11 +2344,12 @@ with tab_dash:
             if not weekly_actual.empty:
                 _tw = str((pd.Timestamp(sorted(weekly_actual["week_start"].unique())[-1])
                            + pd.Timedelta(days=7)).date())
-                # Freeze the BASE statistical forecast, not the event-adjusted one. Events are
-                # layered on top at every display point, so freezing the adjusted figure would
-                # add them twice. This keeps the frozen value comparable with how history is
-                # rendered everywhere else.
-                for _sl, _sv in type_level_forecasts.items():
+                # Freeze the FINAL number as displayed -- base forecast PLUS whatever events
+                # were live at the time. That is what was actually promised. Freezing only the
+                # base meant that stopping an event later removed 1,000 kg from a week that had
+                # already been forecast with it, which is exactly the drift being fixed here.
+                # Events are NOT re-applied to frozen periods (see walk_forward_all_segments).
+                for _sl, _sv in type_level_forecasts_with_pipeline.items():
                     freeze_segment_forecast(_sl, _tw, _sv, "W")
         else:
             next_week_kg_all = forecast_by_cp["forecast_kg"].sum() if not forecast_by_cp.empty else 0
@@ -2389,7 +2401,11 @@ with tab_dash:
                 # statistical number that was never shown to anyone
                 _acc_adj = event_adjustment_by_period(all_events_all, acc_wf["period"].tolist(), freq="W")
                 acc_wf = acc_wf.copy()
-                acc_wf["forecast_kg"] = acc_wf["forecast_kg"] + acc_wf["period"].map(_acc_adj).fillna(0)
+                # frozen periods already include the events that were live when promised
+                _acc_add = acc_wf["period"].map(_acc_adj).fillna(0)
+                if "_is_frozen" in acc_wf.columns:
+                    _acc_add = _acc_add.where(~acc_wf["_is_frozen"].fillna(False), 0)
+                acc_wf["forecast_kg"] = acc_wf["forecast_kg"] + _acc_add
             acc_map = dict(zip(acc_wf["period"], acc_wf["forecast_kg"])) if not acc_wf.empty else {}
 
             def _week_accuracy(idx):
@@ -2522,7 +2538,10 @@ with tab_dash:
             # actually forecast at the time, events included
             _bt_adj = event_adjustment_by_period(all_events_all, topdown_bt["period"].tolist(), freq=wf_freq)
             topdown_bt = topdown_bt.copy()
-            topdown_bt["forecast_kg"] = topdown_bt["forecast_kg"] + topdown_bt["period"].map(_bt_adj).fillna(0)
+            _bt_add = topdown_bt["period"].map(_bt_adj).fillna(0)
+            if "_is_frozen" in topdown_bt.columns:
+                _bt_add = _bt_add.where(~topdown_bt["_is_frozen"].fillna(False), 0)
+            topdown_bt["forecast_kg"] = topdown_bt["forecast_kg"] + _bt_add
         total_bt = trend_agg.rename(columns={"period": "week_start", "kg": "actual_kg"}).merge(
             topdown_bt.rename(columns={"period": "week_start"}), on="week_start", how="inner")
         total_bt["variance_pct"] = (total_bt["actual_kg"] - total_bt["forecast_kg"]) / total_bt["forecast_kg"].replace(0, np.nan)
@@ -3367,10 +3386,59 @@ with tab_dash:
                     if not _bt.empty:
                         _aj = event_adjustment_by_period(all_events_all, _bt["period"].tolist(), freq="W")
                         _bt = _bt.copy()
-                        _bt["forecast_kg"] = _bt["forecast_kg"] + _bt["period"].map(_aj).fillna(0)
+                        _add = _bt["period"].map(_aj).fillna(0)
+                        if "_is_frozen" in _bt.columns:
+                            _add = _add.where(~_bt["_is_frozen"].fillna(False), 0)
+                        _bt["forecast_kg"] = _bt["forecast_kg"] + _add
                         _tr = _tr.merge(_bt.rename(columns={"period": "Week", "forecast_kg": "Forecast kg"}),
                                         on="Week", how="left")
                     _tr.to_excel(_xw, sheet_name="Weekly trend", index=False)
+
+                    # Native Excel charts, not just tables. A sales team opening this needs to
+                    # see the shape of demand at a glance -- a wall of numbers doesn't answer
+                    # "are we going up or down" the way a line does.
+                    _ws = _xw.sheets["Weekly trend"]
+                    _nrows = len(_tr) + 1
+                    _ncols = len(_tr.columns)
+                    _ch = LineChart()
+                    _ch.title = "Actual vs forecast — weekly kg"
+                    _ch.y_axis.title = "kg"
+                    _ch.x_axis.title = "Week"
+                    _kg_cols = [i + 1 for i, col in enumerate(_tr.columns)
+                                if col in ("Actual kg", "Forecast kg")]
+                    if _kg_cols:
+                        for _ci in _kg_cols:
+                            _ch.add_data(Reference(_ws, min_col=_ci, min_row=1, max_row=_nrows),
+                                          titles_from_data=True)
+                        _ch.set_categories(Reference(_ws, min_col=1, min_row=2, max_row=_nrows))
+                        _ch.width, _ch.height = 28, 12
+                        _ws.add_chart(_ch, f"{openpyxl.utils.get_column_letter(_ncols + 2)}2")
+
+                    if "Actual revenue" in _tr.columns:
+                        _cr = LineChart()
+                        _cr.title = "Actual revenue — weekly $"
+                        _cr.y_axis.title = "$"
+                        _cr.x_axis.title = "Week"
+                        _ri = list(_tr.columns).index("Actual revenue") + 1
+                        _cr.add_data(Reference(_ws, min_col=_ri, min_row=1, max_row=_nrows),
+                                      titles_from_data=True)
+                        _cr.set_categories(Reference(_ws, min_col=1, min_row=2, max_row=_nrows))
+                        _cr.width, _cr.height = 28, 12
+                        _ws.add_chart(_cr, f"{openpyxl.utils.get_column_letter(_ncols + 2)}26")
+
+                    # forecast by segment as a bar chart on its own sheet
+                    _wsg = _xw.sheets["Forecast by segment"]
+                    _segn = len(_seg_fc_exp) + 1
+                    if _segn > 1:
+                        _cb = BarChart()
+                        _cb.type = "bar"
+                        _cb.title = "Next week forecast by segment (kg)"
+                        _cb.x_axis.title = "kg"
+                        _cb.add_data(Reference(_wsg, min_col=2, min_row=1, max_row=_segn),
+                                      titles_from_data=True)
+                        _cb.set_categories(Reference(_wsg, min_col=1, min_row=2, max_row=_segn))
+                        _cb.width, _cb.height = 24, 10
+                        _wsg.add_chart(_cb, "D2")
 
                 elif _team.startswith("Green coffee"):
                     _fname = f"green_coffee_plan_{cycle}.xlsx"

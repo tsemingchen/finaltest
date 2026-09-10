@@ -189,6 +189,10 @@ def get_conn():
         seasonal_p INTEGER, seasonal_d INTEGER, seasonal_q INTEGER, seasonal_m INTEGER,
         found_at TEXT
     )""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS segment_forecast_log (
+        {id_col},
+        segment TEXT, target_period TEXT, freq TEXT, forecast_kg REAL, generated_at TEXT
+    )""")
     conn.execute(f"""CREATE TABLE IF NOT EXISTS seasonal_factors (
         {id_col},
         month INTEGER, factor REAL, updated_at TEXT, updated_by TEXT
@@ -666,6 +670,42 @@ def is_supplier_labelled(product, size_label, group_map):
     if grp not in SUPPLIER_LABELLED_GROUPS:
         return False
     return SUPPLIER_LABELLED_SIZE_HINT in str(size_label)
+
+
+def freeze_segment_forecast(segment, target_period, forecast_kg, freq="W"):
+    """Records what a segment was forecast at for a given period, once.
+
+    A forecast has to be a promise, not a recalculation. Previously the segment tables
+    recomputed history every time the page loaded, so once actuals arrived the number shown
+    for that week could shift -- a week forecast at 6,930 kg later displayed as 5,930 kg.
+    That destroys the accuracy story, because nobody can check a prediction that changes
+    after the fact. Writing it once and never overwriting means the record stands."""
+    try:
+        existing = pd.read_sql(
+            "SELECT id FROM segment_forecast_log WHERE segment = ? AND target_period = ? AND freq = ?",
+            conn, params=(str(segment), str(target_period), freq))
+        if not existing.empty:
+            return  # already promised for this period -- never rewrite it
+        conn.execute("""INSERT INTO segment_forecast_log
+            (segment, target_period, freq, forecast_kg, generated_at) VALUES (?,?,?,?,?)""",
+            (str(segment), str(target_period), freq, float(forecast_kg), datetime.now().isoformat()))
+        conn.commit()
+    except Exception:
+        pass  # logging a forecast must never break the page
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_frozen_segment_forecasts(freq="W"):
+    """Every forecast previously promised, keyed (segment, period)."""
+    try:
+        df = pd.read_sql(
+            "SELECT segment, target_period, forecast_kg FROM segment_forecast_log WHERE freq = ?",
+            conn, params=(freq,))
+        if df.empty:
+            return {}
+        return {(r["segment"], r["target_period"]): float(r["forecast_kg"]) for _, r in df.iterrows()}
+    except Exception:
+        return {}
 
 
 def load_known_classifications():
@@ -1786,6 +1826,21 @@ def detect_seasonal_period(series, candidates=(2, 3, 4, 5, 6, 8, 12, 13, 26, 52)
     return max(qualifying) if qualifying else None
 
 
+@st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
+def _monthly_backtest(months, values):
+    """What the model would have forecast for each past month, using only prior data.
+
+    Cached because it runs one model fit per month and lives in a tab Streamlit re-renders on
+    EVERY interaction -- uncached it was ~30 ARIMA fits on every single click, anywhere in the
+    app, which is exactly the kind of invisible cost that makes a page feel stuck."""
+    out = {}
+    for i in range(2, len(values)):
+        f = trend_forecast(list(values[:i]))
+        if f is not None:
+            out[months[i]] = f
+    return out
+
+
 def project_forward_with_range(actual_series, error_sigma, n_periods=8, keep_trend=False,
                                 seasonal_period=None, order=None):
     """Projects multiple periods ahead using a single non-seasonal ARIMA(1,1,1) fit, which
@@ -2260,6 +2315,13 @@ with tab_dash:
 
         if type_level_forecasts:
             next_week_kg_all = sum(type_level_forecasts_with_pipeline.values()) + unattributed_pipeline
+            # Freeze what each segment was promised for the week being forecast, so the number
+            # shown for that week never changes once actuals arrive.
+            if not weekly_actual.empty:
+                _tw = str((pd.Timestamp(sorted(weekly_actual["week_start"].unique())[-1])
+                           + pd.Timedelta(days=7)).date())
+                for _sl, _sv in type_level_forecasts_with_pipeline.items():
+                    freeze_segment_forecast(_sl, _tw, _sv, "W")
         else:
             next_week_kg_all = forecast_by_cp["forecast_kg"].sum() if not forecast_by_cp.empty else 0
         next_week_cad_all = dollar_by_cp["forecast_cad"].sum() if not dollar_by_cp.empty else 0
@@ -2705,6 +2767,17 @@ with tab_dash:
                                 _wadj = event_adjustment_by_period(_seg_ev, wf["period"].tolist(), freq="W")
                                 wf = wf.copy()
                                 wf["forecast_kg"] = wf["forecast_kg"] + wf["period"].map(_wadj).fillna(0)
+                        # Prefer the FROZEN forecast for any week we already promised one for.
+                        # Recomputing history means the number can drift once actuals land,
+                        # which is exactly what made a week forecast at 6,930 kg later show as
+                        # 5,930 kg. The promise wins; the recomputation is only a fallback for
+                        # weeks that predate this log.
+                        _frozen = load_frozen_segment_forecasts("W")
+                        if _frozen and not wf.empty:
+                            wf = wf.copy()
+                            wf["forecast_kg"] = [
+                                _frozen.get((pt, str(p)), v)
+                                for p, v in zip(wf["period"], wf["forecast_kg"])]
                         stored_by_week = wf.rename(columns={"period": "Period", "forecast_kg": "Forecast (kg)"})
                         recent_actual = recent_actual.merge(stored_by_week, on="Period", how="left")
                     else:
@@ -4135,6 +4208,12 @@ with tab_salesplan:
     )
     if not has_data:
         st.info("Upload sales history to see this.")
+    elif not st.session_state.get("show_season_chart"):
+        # Behind a button on purpose: this tab is re-rendered by Streamlit on every
+        # interaction anywhere in the app, so anything unguarded here is paid for constantly.
+        if st.button("Show sales history & seasonality check", key="btn_season"):
+            st.session_state["show_season_chart"] = True
+            st.rerun()
     else:
         _hist_all = sales_df.copy()
         _hist_all["record_date"] = pd.to_datetime(_hist_all["record_date"], errors="coerce")
@@ -4314,12 +4393,9 @@ with tab_salesplan:
                 # happened, using only the data available before each one. Without this the
                 # system line only exists in the future, so you can never check it against
                 # actuals -- which is the one comparison that tells you if the model is any good.
-                _hist = company_monthly_agg.reset_index(drop=True)
-                _back = {}
-                for _i in range(2, len(_hist)):
-                    _f = trend_forecast(_hist["kg"].iloc[:_i].tolist())
-                    if _f is not None:
-                        _back[_hist["month"].iloc[_i]] = _f
+                _back = _monthly_backtest(
+                    company_monthly_agg["month"].tolist(),
+                    company_monthly_agg["kg"].tolist())
                 recon["demand_sensing_kg"] = recon["demand_sensing_kg"].fillna(
                     recon["month"].map(_back))
 

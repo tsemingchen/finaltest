@@ -3601,7 +3601,14 @@ with tab_data:
             else:
                 st.success("Every product is classified — remembered from before, or auto-detected just now.")
 
-        batch_name = st.text_input("Name this upload batch", value=f"upload_{datetime.now().strftime('%Y%m%d_%H%M')}")
+        # The default is generated ONCE per session and stored, not recomputed on every run.
+        # Previously value= called datetime.now() on each rerun, so Streamlit reset the box to
+        # a fresh timestamp and silently discarded whatever name had been typed.
+        if "_batch_default" not in st.session_state:
+            st.session_state["_batch_default"] = f"upload_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        batch_name = st.text_input("Name this upload batch",
+                                    value=st.session_state["_batch_default"],
+                                    key="batch_name_input")
 
         if st.button("Process and save", type="primary"):
             # Guard against double-inserting the same batch. Real bug: nothing stopped the
@@ -3677,6 +3684,8 @@ with tab_data:
 
             reset_all_derived_state()
             st.session_state.pop("_upload_inflight", None)  # clear the guard once safely written
+            st.session_state.pop("_batch_default", None)    # fresh suggestion for the next upload
+            st.session_state.pop("batch_name_input", None)
             st.success(f"Saved {len(std)} records from batch '{batch_name}'. Forecast will update below.")
             st.rerun()
 

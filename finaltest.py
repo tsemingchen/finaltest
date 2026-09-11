@@ -3385,9 +3385,33 @@ with tab_dash:
                         ("Capacity", ("Shortfall" if (cap_gap or 0) < 0 else "Covered")
                          if cap_gap is not None else "Not set"),
                     ])
-                _charts_html = _figs["trend"].to_html(include_plotlyjs="cdn", full_html=False)
+                def _for_print(fig, height=420):
+                    """Re-lay-out a Dashboard figure for a standalone page.
+
+                    On screen the chart sits in a Streamlit container that supplies its own
+                    width and padding, so the margins are deliberately tight. Written straight
+                    to an HTML file those same margins clip the y-axis labels and let the
+                    x-axis title collide with the tick labels -- which is what happened here.
+                    Copying the figure first means the on-screen version is left untouched."""
+                    f2 = go.Figure(fig)
+                    f2.update_layout(
+                        height=height,
+                        autosize=True,
+                        margin=dict(l=90, r=40, t=60, b=80),
+                        font=dict(size=13),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.04,
+                                    xanchor="left", x=0, font=dict(size=12)),
+                    )
+                    f2.update_xaxes(automargin=True, title_standoff=22)
+                    f2.update_yaxes(automargin=True, title_standoff=18)
+                    return f2
+
+                _cfg = {"responsive": True, "displayModeBar": False}
+                _charts_html = _for_print(_figs["trend"], 460).to_html(
+                    include_plotlyjs="cdn", full_html=False, config=_cfg)
                 for _nm, _f in (_figs.get("segments") or {}).items():
-                    _charts_html += f"<h2>{_nm}</h2>" + _f.to_html(include_plotlyjs=False, full_html=False)
+                    _charts_html += f"<h2>{_nm}</h2>" + _for_print(_f, 360).to_html(
+                        include_plotlyjs=False, full_html=False, config=_cfg)
 
                 _html = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Demand Planning — {cycle}</title>
@@ -3399,7 +3423,13 @@ with tab_dash:
         border-bottom:1px solid #ddd;padding:14px 0;margin-bottom:8px;}}
  .kl{{font-size:11px;color:#666;}} .kv{{font-size:24px;font-weight:700;}}
  .meta{{color:#777;font-size:11px;margin-top:26px;}}
- @media print{{ .pb{{page-break-before:always;}} }}
+ .js-plotly-plot{{width:100% !important;}}
+ @media print{{
+   body{{margin:14mm;}}
+   h2,.js-plotly-plot{{break-inside:avoid;page-break-inside:avoid;}}
+   .kpis{{break-inside:avoid;}}
+ }}
+ @page{{ size:A4 landscape; margin:12mm; }}
 </style></head><body>
 <h1>Sales to Operations Demand Planning</h1>
 <div class="sub">49TH PARALLEL COFFEE ROASTERS &middot; CYCLE {cycle}</div>

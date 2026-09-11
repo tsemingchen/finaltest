@@ -2626,6 +2626,9 @@ with tab_dash:
                                  legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                              xanchor="left", x=0, font=dict(size=11)))
         st.plotly_chart(fig_trend, use_container_width=True)
+        # keep the actual figure for the export -- rebuilding it separately is how the two
+        # drifted apart before, and why the exported charts looked nothing like the screen
+        st.session_state["_ov_figs"] = {"trend": fig_trend}
 
         st.divider()
 
@@ -2863,6 +2866,7 @@ with tab_dash:
                                           legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                                       xanchor="left", x=0, font=dict(size=9)))
                     st.plotly_chart(fig_pt, use_container_width=True)
+                    st.session_state.setdefault("_ov_figs", {}).setdefault("segments", {})[pt] = fig_pt
 
             st.divider()
 
@@ -3359,7 +3363,62 @@ with tab_dash:
              "Packaging — bag order by size and item"],
             key="export_team")
 
-        if st.button("Build the export", key="build_team_export", type="primary"):
+        _fmt = st.radio("Format", ["PDF / print-ready", "Excel (data tables)"], horizontal=True,
+                        key="export_fmt",
+                        help="PDF reproduces the Overview charts exactly as they appear on screen. "
+                             "Excel is for anyone who needs the underlying numbers to work with.")
+
+        # ---------- PDF / print-ready: the Overview, reproduced ----------
+        if _fmt.startswith("PDF") and _team.startswith("Sales"):
+            _figs = st.session_state.get("_ov_figs", {})
+            if not _figs.get("trend"):
+                st.info("Scroll through the Dashboard once first — the export reuses the charts "
+                        "exactly as they're drawn there, so they have to have been rendered.")
+            elif st.button("Build the report", key="build_pdf_report", type="primary"):
+                _kpi_rows = "".join(
+                    f"<div class='k'><div class='kl'>{_l}</div><div class='kv'>{_v}</div></div>"
+                    for _l, _v in [
+                        (f"Forecast: {forecast_period_label}", f"{next_week_kg_all:,.0f} kg"),
+                        ("Forecast value", f"${next_week_cad_all:,.0f}"),
+                        (f"Actual — week of {latest_actual_week or 'n/a'}",
+                         f"{(latest_actual_kg or 0):,.0f} kg"),
+                        ("Capacity", ("Shortfall" if (cap_gap or 0) < 0 else "Covered")
+                         if cap_gap is not None else "Not set"),
+                    ])
+                _charts_html = _figs["trend"].to_html(include_plotlyjs="cdn", full_html=False)
+                for _nm, _f in (_figs.get("segments") or {}).items():
+                    _charts_html += f"<h2>{_nm}</h2>" + _f.to_html(include_plotlyjs=False, full_html=False)
+
+                _html = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Demand Planning — {cycle}</title>
+<style>
+ body{{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1A1A1A;margin:32px;}}
+ h1{{font-size:26px;margin:0 0 4px;}} h2{{font-size:16px;margin:26px 0 6px;color:#2F6F6B;}}
+ .sub{{color:#2F6F6B;font-weight:600;letter-spacing:.5px;font-size:12px;margin-bottom:18px;}}
+ .kpis{{display:flex;gap:28px;flex-wrap:wrap;border-top:3px solid #2F6F6B;
+        border-bottom:1px solid #ddd;padding:14px 0;margin-bottom:8px;}}
+ .kl{{font-size:11px;color:#666;}} .kv{{font-size:24px;font-weight:700;}}
+ .meta{{color:#777;font-size:11px;margin-top:26px;}}
+ @media print{{ .pb{{page-break-before:always;}} }}
+</style></head><body>
+<h1>Sales to Operations Demand Planning</h1>
+<div class="sub">49TH PARALLEL COFFEE ROASTERS &middot; CYCLE {cycle}</div>
+<div class="kpis">{_kpi_rows}</div>
+<h2>Overall trend</h2>
+{_charts_html}
+<p class="meta">Generated {datetime.now().strftime('%d %b %Y, %H:%M')}.
+Open in any browser and print to PDF for a fixed copy.</p>
+</body></html>"""
+                st.download_button("Download report (HTML — print to PDF)", _html,
+                                    f"demand_report_{cycle}.html", mime="text/html")
+                st.caption("Open it and use your browser's Print → Save as PDF. The charts are the "
+                           "same ones from the Dashboard, so it looks like what you saw on screen.")
+
+        elif _fmt.startswith("PDF"):
+            st.info("The print-ready report currently covers the Sales view. For Green coffee and "
+                    "Packaging, use Excel — those teams work from the numbers rather than the charts.")
+
+        elif st.button("Build the export", key="build_team_export", type="primary"):
             _buf = io.BytesIO()
             _fname = "export.xlsx"
             with pd.ExcelWriter(_buf, engine="openpyxl") as _xw:

@@ -2576,6 +2576,16 @@ with tab_dash:
                         "low": sum(v["low"].iloc[:_n] for v in _seg_fwd.values()),
                         "high": sum(v["high"].iloc[:_n] for v in _seg_fwd.values()),
                     })
+                    # Anchor period 1 to the SAME number the KPI shows. The KPI sums each
+                    # segment's single-step forecast plus events; this chart builds a
+                    # multi-period projection. They are genuinely different calculations, so
+                    # without anchoring the chart's first point disagreed with the headline
+                    # figure for the very same week. Shifting the whole path by one constant
+                    # keeps its shape while making the first point match exactly.
+                    if trend_freq == "Week" and next_week_kg_all and not projection.empty:
+                        _shift = next_week_kg_all - float(projection["forecast_kg"].iloc[0])
+                        for _col in ("forecast_kg", "low", "high"):
+                            projection[_col] = (projection[_col] + _shift).clip(lower=0)
                 else:
                     projection = project_forward_with_range(trend_agg["kg"].tolist(), error_sigma,
                                                             n_periods=n_periods_fwd, keep_trend=True)

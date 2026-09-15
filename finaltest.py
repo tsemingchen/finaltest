@@ -359,7 +359,11 @@ def compute_price_per_kg(df, recent_days=45):
         d = recent if len(recent) >= 20 else d  # fall back to more history if too little recent data
     g = d.groupby(["channel", "product", "size_label"], as_index=False).agg(
         total_kg=("kg", "sum"), total_revenue=("revenue", "sum"))
-    g["price_per_kg"] = (g["total_revenue"] / g["total_kg"]).round(2)
+    # guard the divide. Real bug: an item with revenue but zero kg (a fee line, a correction,
+    # a rounding artefact) produced inf, and a single inf makes the whole company dollar
+    # total inf -- which is exactly what "$inf" on the dashboard was.
+    g["price_per_kg"] = (g["total_revenue"] / g["total_kg"].replace(0, np.nan)).round(2)
+    g = g.replace([np.inf, -np.inf], np.nan)
 
     # customer-level price range within each group, so blending is visible, not hidden
     if "customer" in df.columns and not (df["customer"] == "(not tracked)").all():
@@ -410,7 +414,8 @@ def compute_customer_price_per_kg(df, recent_days=45, min_transactions=3):
 
     g = d.groupby(["channel", "customer", "product"], as_index=False).agg(
         total_kg=("kg", "sum"), total_revenue=("revenue", "sum"), n_transactions=("kg", "count"))
-    g["customer_price_per_kg"] = (g["total_revenue"] / g["total_kg"]).round(2)
+    g["customer_price_per_kg"] = (g["total_revenue"] / g["total_kg"].replace(0, np.nan)).round(2)
+    g = g.replace([np.inf, -np.inf], np.nan)
     g["confident"] = g["n_transactions"] >= min_transactions
 
     channel_price = compute_price_per_kg(df, recent_days=recent_days)
@@ -2239,8 +2244,12 @@ if not translated.empty and not price_df.empty:
     except Exception:
         pass  # customer refinement is a bonus; never let it break the dollar figure
 
+    # belt and braces: never let a non-finite rate reach the headline dollar figure
+    dollar_view["_rate_used"] = pd.to_numeric(dollar_view["_rate_used"], errors="coerce") \
+        .replace([np.inf, -np.inf], np.nan)
     _unpriced_kg = float(dollar_view.loc[dollar_view["_rate_used"].isna(), "forecast_kg"].sum())
     dollar_view["forecast_cad"] = (dollar_view["forecast_kg"] * dollar_view["_rate_used"]).round(2)
+    dollar_view["forecast_cad"] = dollar_view["forecast_cad"].replace([np.inf, -np.inf], np.nan)
     dollar_by_cp = dollar_view.groupby(["channel", "product"], as_index=False).agg(
         forecast_kg=("forecast_kg", "sum"), forecast_cad=("forecast_cad", "sum"))
 else:
@@ -2374,9 +2383,25 @@ with tab_dash:
         d_kpi = d_kpi.dropna(subset=["record_date"])
         latest_actual_kg = None
         latest_actual_week = None
+        _partial_week_note = None
         if not d_kpi.empty:
             d_kpi["week_start"] = (d_kpi["record_date"] - pd.to_timedelta(d_kpi["record_date"].dt.weekday, unit="D")).dt.date.astype(str)
             wk_kpi = d_kpi.groupby("week_start")["kg"].sum().sort_index()
+            # Exclude the final week when it's still in progress. Real bug: with data through
+            # a Tuesday, the current week held ~1 day of sales and was shown as "last week's
+            # actual" against a full-week forecast -- 1,099 kg vs ~7,000 kg, reported as 16%
+            # accurate. That is not a bad forecast, it's an incomplete week being graded as a
+            # complete one, and it drags the headline accuracy figure down for no real reason.
+            if len(wk_kpi):
+                _last_day = d_kpi["record_date"].max()
+                _last_wk_start = pd.Timestamp(wk_kpi.index[-1])
+                if _last_day < _last_wk_start + pd.Timedelta(days=6):
+                    _partial_week_note = (
+                        f"Week of {wk_kpi.index[-1]} is still in progress (data through "
+                        f"{_last_day.strftime('%b %d')}), so it's excluded from the actual and "
+                        "accuracy figures — a part week compared against a full-week forecast "
+                        "would read as a huge miss.")
+                    wk_kpi = wk_kpi.iloc[:-1]
             if len(wk_kpi):
                 latest_actual_kg = wk_kpi.iloc[-1]
                 latest_actual_week = wk_kpi.index[-1]
@@ -2388,6 +2413,12 @@ with tab_dash:
         last_week_accuracy_label, last_week_accuracy_delta = "n/a", None
         if not d_kpi.empty:
             company_weekly = d_kpi.groupby("week_start")["kg"].sum().sort_index()
+            # same exclusion as above -- grading a part week makes accuracy meaningless
+            if len(company_weekly):
+                _ld2 = d_kpi["record_date"].max()
+                _lw2 = pd.Timestamp(company_weekly.index[-1])
+                if _ld2 < _lw2 + pd.Timedelta(days=6):
+                    company_weekly = company_weekly.iloc[:-1]
             weeks_list = company_weekly.index.tolist()
 
             # measure accuracy against the SAME segment-based forecast the rest of the
@@ -2460,6 +2491,9 @@ with tab_dash:
                       delta=f"{cap_gap:,.0f} kg/mo", delta_color="normal" if cap_gap >= 0 else "inverse")
         else:
             k5.metric("Capacity", "Not set", help="Set it in tab 5 to see a shortfall check here.")
+
+        if _partial_week_note:
+            st.info(_partial_week_note)
 
         # show the arithmetic behind the headline number. Without this it's impossible to tell
         # from the dashboard whether a logged event or override actually reached the total --
